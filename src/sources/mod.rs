@@ -156,6 +156,7 @@ mod tests {
         let j = journal::Journal {
             machine: None,
             since: "7d".into(),
+            via_ssh: None,
         };
         let cmd = j.command();
         let got: Vec<&str> = cmd.iter().map(String::as_str).collect();
@@ -170,6 +171,7 @@ mod tests {
         let j = journal::Journal {
             machine: Some("media-01".into()),
             since: "7d".into(),
+            via_ssh: None,
         };
         assert!(j.command().contains(&"-M".to_string()));
         assert!(j.command().contains(&"media-01".to_string()));
@@ -182,6 +184,7 @@ mod tests {
         let j = journal::Journal {
             machine: Some("media-01".into()),
             since: "7d".into(),
+            via_ssh: None,
         };
         let joined = j.command().join(" ");
         assert!(!joined.contains("Api-Key"));
@@ -217,6 +220,81 @@ mod tests {
         assert!(
             cmd.iter().any(|a| a.contains("--fail")),
             "the ssh-wrapped curl call must carry --fail too: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn journal_local_command_unchanged_by_via_ssh_none() {
+        let j = journal::Journal {
+            machine: None,
+            since: "7d".into(),
+            via_ssh: None,
+        };
+        let cmd = j.command();
+        let got: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        assert_eq!(
+            got,
+            vec!["journalctl", "--output=cat", "--no-pager", "--since", "-7d"]
+        );
+    }
+
+    #[test]
+    fn journal_wraps_the_call_in_ssh_when_asked() {
+        let j = journal::Journal {
+            machine: None,
+            since: "7d".into(),
+            via_ssh: Some("root@server.taile9e283.ts.net".into()),
+        };
+        let cmd = j.command();
+        assert_eq!(cmd[0], "ssh");
+        assert!(cmd.contains(&"root@server.taile9e283.ts.net".to_string()));
+        assert!(
+            cmd.iter().any(|a| a.contains("journalctl")),
+            "the ssh-wrapped journalctl call must contain journalctl: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn journal_guest_with_ssh_produces_well_formed_command() {
+        let j = journal::Journal {
+            machine: Some("media-01".into()),
+            since: "7d".into(),
+            via_ssh: Some("root@server.taile9e283.ts.net".into()),
+        };
+        let cmd = j.command();
+        assert_eq!(cmd[0], "ssh");
+        assert!(cmd.contains(&"root@server.taile9e283.ts.net".to_string()));
+        // The joined command must contain both -M and the guest name
+        let joined = cmd.join(" ");
+        assert!(
+            joined.contains("-M"),
+            "ssh-wrapped journalctl must include -M flag: {joined}"
+        );
+        assert!(
+            joined.contains("media-01"),
+            "ssh-wrapped journalctl must include guest name: {joined}"
+        );
+    }
+
+    #[test]
+    fn journal_locate_returns_different_locations_for_local_and_remote() {
+        let local = journal::Journal {
+            machine: Some("media-01".into()),
+            since: "7d".into(),
+            via_ssh: None,
+        };
+        let (_, local_loc) = local.locate("test line");
+        assert_eq!(local_loc, "media-01", "local should show only machine name");
+
+        let remote = journal::Journal {
+            machine: Some("media-01".into()),
+            since: "7d".into(),
+            via_ssh: Some("root@server.taile9e283.ts.net".into()),
+        };
+        let (_, remote_loc) = remote.locate("test line");
+        assert_eq!(
+            remote_loc, "root@server.taile9e283.ts.net:media-01",
+            "remote should include target and machine"
         );
     }
 

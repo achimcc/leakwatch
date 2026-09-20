@@ -189,6 +189,7 @@ fn build_sources(
             "journal" => out.push(Box::new(Journal {
                 machine: None,
                 since: since.to_string(),
+                via_ssh: ssh.clone(),
             })),
             "loki" => out.push(Box::new(Loki {
                 base: loki_base.to_string(),

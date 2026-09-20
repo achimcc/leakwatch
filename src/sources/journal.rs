@@ -12,6 +12,7 @@ use std::io::BufRead;
 pub struct Journal {
     pub machine: Option<String>,
     pub since: String,
+    pub via_ssh: Option<String>,
 }
 
 impl Journal {
@@ -25,7 +26,17 @@ impl Journal {
         c.push("--no-pager".into());
         c.push("--since".into());
         c.push(format!("-{}", self.since));
-        c
+
+        match &self.via_ssh {
+            None => c,
+            Some(target) => vec![
+                "ssh".to_string(),
+                "-o".to_string(),
+                "IdentitiesOnly=yes".to_string(),
+                target.clone(),
+                c.join(" "),
+            ],
+        }
     }
 }
 
@@ -37,9 +48,12 @@ impl Source for Journal {
         spawn(&self.command())
     }
     fn locate(&self, _line: &str) -> (String, String) {
-        (
-            "journal".to_string(),
-            self.machine.clone().unwrap_or_else(|| "host".to_string()),
-        )
+        let location = match (&self.via_ssh, &self.machine) {
+            (Some(target), Some(m)) => format!("{}:{}", target, m),
+            (Some(target), None) => target.clone(),
+            (None, Some(m)) => m.clone(),
+            (None, None) => "local".to_string(),
+        };
+        ("journal".to_string(), location)
     }
 }
