@@ -1,6 +1,6 @@
 [package]
 name = "leakwatch"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Find secrets where they do not belong — by knowing their values, not by guessing their shape"

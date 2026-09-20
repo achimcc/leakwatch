@@ -338,23 +338,35 @@ fn execute(
 
     for source in &sources {
         let name = source.name().to_string();
+        // WHICH one — the metric folds several sources of the same name into
+        // one line (see `metrics::render`), so the error line is the only
+        // place that can still say WHICH guest was silent. Without it
+        // "journal: the source itself was silent" points at 33 candidates.
+        // `locate` ignores the line for every adapter, so an empty one is
+        // enough to ask for the location.
+        let (_, wo) = source.locate("");
+        let woher = if wo == name {
+            name.clone()
+        } else {
+            format!("{name} ({wo})")
+        };
         match process_source(source.as_ref(), &scanner, config, &now_str, &mut state) {
             Ok((lines_read, canary_found)) => {
                 if !canary_found {
                     state.out_lines.push(format!(
-                        "ERROR: {name}: canary not found — this run proves nothing"
+                        "ERROR: {woher}: canary not found — this run proves nothing"
                     ));
                     tool_failure = true;
                 } else if canary::source_was_silent(lines_read) {
                     state.out_lines.push(format!(
-                        "ERROR: {name}: only the canary arrived — the source itself was silent"
+                        "ERROR: {woher}: only the canary arrived — the source itself was silent"
                     ));
                     tool_failure = true;
                 }
                 canaries.push((name, canary_found));
             }
             Err(e) => {
-                state.out_lines.push(format!("ERROR: {name}: {e}"));
+                state.out_lines.push(format!("ERROR: {woher}: {e}"));
                 tool_failure = true;
                 canaries.push((name, false));
             }

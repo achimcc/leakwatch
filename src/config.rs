@@ -17,6 +17,29 @@ pub struct Exception {
     pub source: String,
     /// Mandatory. An exception without a reason is an omission.
     pub reason: String,
+    /// Opt out of the staleness check for a finding that is legitimate but
+    /// INTERMITTENT.
+    ///
+    /// WHY THIS EXISTS: "an exception that matches nothing turns the run red"
+    /// is there to stop a list from rotting. It assumes a finding either
+    /// keeps happening or is gone for good. Real logs are not like that. A
+    /// mail server writes the sender address when it sends mail and stays
+    /// quiet otherwise; a client logs its own account name when it
+    /// reconnects. Such an exception matches in one window and not in the
+    /// next, and both available answers are wrong: keep it and the run goes
+    /// red for a healthy system, drop it and an identifier raises an alert.
+    ///
+    /// Measured on a real installation on 2026-09-20: an exception with 18
+    /// hits in a three-hour window matched nothing three hours later, because
+    /// those 18 were one burst and not a rate. Frequency is not a safe proxy
+    /// for "will be there next time".
+    ///
+    /// It is deliberately opt-in and per entry. A file where every exception
+    /// is `optional` has given up the staleness check — which is why the flag
+    /// belongs on the entry that needs it, next to the reason that explains
+    /// why it is intermittent.
+    #[serde(default)]
+    pub optional: bool,
 }
 
 impl Config {
@@ -27,9 +50,13 @@ impl Config {
     }
 
     /// Exceptions that matched nothing in this run.
+    ///
+    /// `optional` entries are skipped: they describe findings that come and
+    /// go, so "matched nothing this time" says nothing about them.
     pub fn unused(&self, hits: &[(String, String)]) -> Vec<String> {
         self.exceptions
             .iter()
+            .filter(|e| !e.optional)
             .filter(|e| {
                 !hits
                     .iter()
@@ -105,6 +132,69 @@ mod tests {
         .unwrap();
         // After a run with no hit on `gone`:
         assert_eq!(c.unused(&[]), vec!["gone/journal".to_string()]);
+    }
+
+    #[test]
+    fn an_optional_exception_is_never_reported_as_unused() {
+        let c: Config = toml::from_str(
+            r#"
+            [[exception]]
+            secret = "smtp-user"
+            source = "journal"
+            optional = true
+            reason = "the mail log carries the sender only while mail is going out"
+            "#,
+        )
+        .unwrap();
+        assert!(
+            c.unused(&[]).is_empty(),
+            "an optional exception must survive a window in which it matches nothing"
+        );
+        // It still excepts when the finding does show up.
+        assert!(c.excepted("smtp-user", "journal"));
+    }
+
+    #[test]
+    fn optional_defaults_to_false_so_the_staleness_check_stays_on() {
+        let c: Config = toml::from_str(
+            r#"
+            [[exception]]
+            secret = "gone"
+            source = "journal"
+            reason = "no optional flag given"
+            "#,
+        )
+        .unwrap();
+        assert!(!c.exceptions[0].optional);
+        assert_eq!(
+            c.unused(&[]),
+            vec!["gone/journal".to_string()],
+            "leaving the flag out must not quietly disable the check"
+        );
+    }
+
+    #[test]
+    fn optional_and_mandatory_exceptions_coexist() {
+        let c: Config = toml::from_str(
+            r#"
+            [[exception]]
+            secret = "kommt-und-geht"
+            source = "journal"
+            optional = true
+            reason = "intermittent by nature"
+
+            [[exception]]
+            secret = "sollte-immer-da-sein"
+            source = "loki"
+            reason = "steady"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.unused(&[]),
+            vec!["sollte-immer-da-sein/loki".to_string()],
+            "only the mandatory one may be reported"
+        );
     }
 
     #[test]

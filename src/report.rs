@@ -1,8 +1,10 @@
 //! The one place that turns a hit into text. Nothing else prints a finding.
 //!
 //! WHY IT IS THE ONLY PLACE: a leak hunter whose own output leaks would be
-//! absurd — and that is exactly how the TNTracker passkey reached the chat on
-//! 2026-09-09, during an exploration that looked harmless.
+//! absurd — and that is exactly how a tracker passkey reached a chat log on
+//! 2026-09-09, during an exploration that looked harmless. The field was
+//! called `trackers` and held an announce URL; nobody was looking for a
+//! secret in it.
 //!
 //! Overlapping spans are merged before redacting to prevent the tail of a secret from
 //! surviving when a shorter mask replaces a longer secret. Debug is hand-written to

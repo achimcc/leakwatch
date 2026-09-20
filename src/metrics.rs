@@ -24,9 +24,38 @@ pub fn render(hits: &[(String, String, u64)], canaries: &[(String, bool)], now: 
             "leakwatch_finding{{secret=\"{secret}\",source=\"{source}\"}} {n}\n"
         ));
     }
+    // ONE LINE PER SOURCE NAME, FOLDED WITH AND — NOT ONE PER SOURCE.
+    //
+    // A run can hold several sources of the SAME name: one `journal` per
+    // guest. Rendering a line each produced repeated label sets, and a
+    // repeated label set is not a metric — `promtool check metrics` calls it
+    // "not unique", and a Prometheus client registry drops every line after
+    // the first. Measured on a real installation on 2026-09-20: 33 identical
+    // `leakwatch_canary_found{source="journal"}` lines, of which exactly one
+    // survived the scrape, while node-exporter logged
+    // `was collected before with the same name and label values` on every
+    // scrape. The neighbouring textfile metrics were unharmed, so nothing
+    // turned red — the positive control simply stopped meaning what it says.
+    //
+    // FOLDED WITH AND, because that is what the question deserves: "did the
+    // journal adapter work?" is false as soon as ONE of its sources failed.
+    // Taking the first (what the registry did by accident) or the maximum
+    // would let a healthy guest cover a broken one — the exact failure the
+    // per-adapter check exists to prevent.
+    //
+    // The GUEST is not lost: it rides in the error line and in `location`,
+    // where it can be read without multiplying label sets — and where it does
+    // not break the exception lists and alert rules that key on `source`.
     out.push_str("# HELP leakwatch_canary_found did the run find anything at all?\n");
     out.push_str("# TYPE leakwatch_canary_found gauge\n");
+    let mut gefaltet: Vec<(String, bool)> = Vec::new();
     for (source, ok) in canaries {
+        match gefaltet.iter_mut().find(|(s, _)| s == source) {
+            Some((_, vorher)) => *vorher = *vorher && *ok,
+            None => gefaltet.push((source.clone(), *ok)),
+        }
+    }
+    for (source, ok) in &gefaltet {
         let source = escape_label(source);
         out.push_str(&format!(
             "leakwatch_canary_found{{source=\"{source}\"}} {}\n",
@@ -57,6 +86,51 @@ mod tests {
     fn a_failed_canary_is_zero_not_absent() {
         let text = render(&[], &[("loki".into(), false)], 1758300000);
         assert!(text.contains("leakwatch_canary_found{source=\"loki\"} 0"));
+    }
+
+    #[test]
+    fn repeated_source_names_render_exactly_one_line() {
+        // The sensor case: one `journal` source per guest.
+        let canaries: Vec<(String, bool)> = (0..33)
+            .map(|_| ("journal".to_string(), true))
+            .chain(std::iter::once(("loki".to_string(), true)))
+            .collect();
+        let text = render(&[], &canaries, 1758300000);
+        let journal_lines = text
+            .lines()
+            .filter(|l| l.starts_with("leakwatch_canary_found{source=\"journal\"}"))
+            .count();
+        assert_eq!(
+            journal_lines, 1,
+            "a repeated label set is not a metric — promtool calls it \"not unique\" \
+             and a registry drops every line after the first:\n{text}"
+        );
+        assert!(text.contains("leakwatch_canary_found{source=\"loki\"} 1"));
+    }
+
+    #[test]
+    fn one_failed_source_makes_the_whole_adapter_zero() {
+        // 32 healthy guests must not cover the one that delivered nothing.
+        let mut canaries: Vec<(String, bool)> =
+            (0..32).map(|_| ("journal".to_string(), true)).collect();
+        canaries.push(("journal".to_string(), false));
+        let text = render(&[], &canaries, 1758300000);
+        assert!(
+            text.contains("leakwatch_canary_found{source=\"journal\"} 0"),
+            "folding must be AND, not first-wins or max:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_order_of_a_failure_among_its_peers_does_not_matter() {
+        // Same set, failure first instead of last.
+        let mut canaries: Vec<(String, bool)> = vec![("journal".to_string(), false)];
+        canaries.extend((0..32).map(|_| ("journal".to_string(), true)));
+        let text = render(&[], &canaries, 1758300000);
+        assert!(
+            text.contains("leakwatch_canary_found{source=\"journal\"} 0"),
+            "a failure seen first must survive the healthy ones after it:\n{text}"
+        );
     }
 
     #[test]

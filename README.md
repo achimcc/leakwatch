@@ -126,6 +126,34 @@ An exception without a reason fails to parse. One that matches nothing in
 a run that could have matched it is reported as a tool failure — an
 exception list that ages silently is worse than no list.
 
+### Intermittent findings: `optional`
+
+That staleness check assumes a finding either keeps happening or is gone for
+good. Real logs are not like that. A mail server writes the sender address
+while mail is going out and stays quiet otherwise; a client logs its own
+account name when it reconnects. Such an exception matches in one window and
+not in the next, and both available answers are wrong: keep it and the run
+goes red for a healthy system, drop it and an identifier raises an alert.
+
+```toml
+[[exception]]
+secret = "smtp-user"
+source = "journal"
+optional = true
+reason = "the mail log carries the sender only while mail is going out"
+```
+
+`optional` exempts that one entry from the staleness check and nothing else —
+it still only excepts the pair it names. The flag defaults to false, so
+leaving it out keeps the check on.
+
+**Do not reach for it to quiet a list.** Frequency is no guide either: an
+exception with 18 hits in a three-hour window has been observed matching
+nothing three hours later, because those 18 were one burst and not a rate.
+The question is whether the finding is intermittent *by nature*, and the
+answer belongs in the `reason` next to it. A file in which every exception is
+`optional` has given up the staleness check.
+
 An exception naming the canary (`leakwatch-canary`) is rejected outright,
 before any source runs: canary hits are filtered before they can become
 findings, so such an exception could never match and would fail every run
@@ -148,6 +176,16 @@ as a stale exception instead — a message pointing at the wrong cause.
 - The canary proves a source delivered lines, not that a specific line was
   read correctly — a source that silently drops a small fraction of its
   output can still look healthy.
+- `leakwatch_canary_found` carries one line per source NAME, not per source.
+  Several journals scanned in one run (one per guest) fold into a single
+  `source="journal"` line, and the fold is an AND: one silent guest makes it
+  zero. Which guest is named in the error line and in `location`, not in the
+  metric — a label per guest would multiply the label sets that exception
+  lists and alert rules key on.
+- `timestamp` is the time of the RUN, not of the line. For the journal the
+  line's own timestamp is in the report text; for the other adapters there is
+  no per-finding time. "Is this one of the leaks from last Tuesday?" is not a
+  question a report answers.
 
 ## Install
 

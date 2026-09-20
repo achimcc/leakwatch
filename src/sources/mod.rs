@@ -162,7 +162,13 @@ mod tests {
         let got: Vec<&str> = cmd.iter().map(String::as_str).collect();
         assert_eq!(
             got,
-            vec!["journalctl", "--output=cat", "--no-pager", "--since", "-7d"]
+            vec![
+                "journalctl",
+                "--output=short-iso",
+                "--no-pager",
+                "--since",
+                "-7d"
+            ]
         );
     }
 
@@ -205,6 +211,11 @@ mod tests {
             cmd.contains(&"--fail".to_string()),
             "curl without --fail treats an HTTP error as success: {cmd:?}"
         );
+        assert!(
+            cmd.iter().any(|a| a.starts_with('-') && a.contains('S')),
+            "curl without -S swallows the reason for a failure and leaves only \
+             an I/O error on the read: {cmd:?}"
+        );
     }
 
     #[test]
@@ -234,7 +245,13 @@ mod tests {
         let got: Vec<&str> = cmd.iter().map(String::as_str).collect();
         assert_eq!(
             got,
-            vec!["journalctl", "--output=cat", "--no-pager", "--since", "-7d"]
+            vec![
+                "journalctl",
+                "--output=short-iso",
+                "--no-pager",
+                "--since",
+                "-7d"
+            ]
         );
     }
 
