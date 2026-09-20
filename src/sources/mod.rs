@@ -17,6 +17,16 @@ pub trait Source {
     fn locate(&self, line: &str) -> (String, String);
 }
 
+/// Where a `ChildReader` stands relative to the child's exit. Distinguishing
+/// `Failed` from "not checked yet" is what stops a second `read()` after an
+/// error from silently reporting a clean end of stream: once failed, it
+/// stays failed on every subsequent call.
+enum ChildState {
+    Running,
+    Done,
+    Failed(String),
+}
+
 /// A reader over a child's stdout that turns a failed command into an error
 /// instead of an empty stream.
 ///
@@ -27,26 +37,38 @@ pub(crate) struct ChildReader {
     inner: std::io::BufReader<std::process::ChildStdout>,
     child: std::process::Child,
     argv0: String,
-    checked: bool,
+    // Drains stderr on its own thread, started at construction time — NOT
+    // read synchronously after `wait()`. A pipe holds only ~64 KiB; a child
+    // that writes more than that to stderr (a `curl -v`, a chatty `ssh`
+    // banner, a journal full of parse warnings) blocks on the write end
+    // until someone reads it, and `wait()` cannot return while the child is
+    // blocked. Reading stderr only after `wait()` is therefore a deadlock
+    // waiting for a large-enough error message, not a simplification of this
+    // code — do not fold it back into a synchronous read.
+    stderr_collector: Option<std::thread::JoinHandle<Vec<u8>>>,
+    state: ChildState,
 }
 
 impl std::io::Read for ChildReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let ChildState::Failed(msg) = &self.state {
+            return Err(std::io::Error::other(msg.clone()));
+        }
         let n = self.inner.read(buf)?;
-        if n == 0 && !self.checked {
-            self.checked = true;
+        if n == 0 && matches!(self.state, ChildState::Running) {
             let status = self.child.wait()?;
             if !status.success() {
-                let mut err = String::new();
-                if let Some(mut e) = self.child.stderr.take() {
-                    let _ = e.read_to_string(&mut err);
-                }
-                return Err(std::io::Error::other(format!(
-                    "{} exited with {status}: {}",
-                    self.argv0,
-                    err.trim()
-                )));
+                let err_bytes = self
+                    .stderr_collector
+                    .take()
+                    .and_then(|h| h.join().ok())
+                    .unwrap_or_default();
+                let err_text = String::from_utf8_lossy(&err_bytes).trim().to_string();
+                let msg = format!("{} exited with {status}: {err_text}", self.argv0);
+                self.state = ChildState::Failed(msg.clone());
+                return Err(std::io::Error::other(msg));
             }
+            self.state = ChildState::Done;
         }
         Ok(n)
     }
@@ -64,11 +86,21 @@ pub(crate) fn spawn(argv: &[String]) -> Result<Box<dyn BufRead>> {
         .spawn()?;
     let out = child.stdout.take().expect("stdout piped");
     let argv0 = argv[0].clone();
+    // Drain stderr concurrently — see the comment on `stderr_collector`.
+    let stderr_collector = child.stderr.take().map(|mut e| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            use std::io::Read as _;
+            let _ = e.read_to_end(&mut buf);
+            buf
+        })
+    });
     Ok(Box::new(std::io::BufReader::new(ChildReader {
         inner: std::io::BufReader::new(out),
         child,
         argv0,
-        checked: false,
+        stderr_collector,
+        state: ChildState::Running,
     })))
 }
 
@@ -166,6 +198,10 @@ mod tests {
         let cmd = l.command();
         assert_eq!(cmd[0], "curl");
         assert!(cmd.iter().any(|a| a.contains("query_range")));
+        assert!(
+            cmd.contains(&"--fail".to_string()),
+            "curl without --fail treats an HTTP error as success: {cmd:?}"
+        );
     }
 
     #[test]
@@ -178,6 +214,10 @@ mod tests {
         let cmd = l.command();
         assert_eq!(cmd[0], "ssh");
         assert!(cmd.contains(&"root@server.taile9e283.ts.net".to_string()));
+        assert!(
+            cmd.iter().any(|a| a.contains("--fail")),
+            "the ssh-wrapped curl call must carry --fail too: {cmd:?}"
+        );
     }
 
     #[test]
@@ -226,6 +266,36 @@ mod tests {
         let mut s = String::new();
         std::io::Read::read_to_string(&mut lf, &mut s).unwrap();
         assert_eq!(s, "one\ntwo\n");
+    }
+
+    #[test]
+    fn a_second_read_after_a_failure_still_errors() {
+        let argv = vec!["sh".to_string(), "-c".to_string(), "exit 3".to_string()];
+        let mut r = spawn(&argv).expect("spawn itself succeeds");
+        let mut buf = [0u8; 16];
+        let first = std::io::Read::read(&mut r, &mut buf);
+        assert!(first.is_err(), "first read should already fail");
+        let second = std::io::Read::read(&mut r, &mut buf);
+        assert!(
+            second.is_err(),
+            "a second read after a failure must not look like a clean EOF"
+        );
+    }
+
+    #[test]
+    fn a_chatty_stderr_does_not_deadlock_a_failing_command() {
+        // The deadlock this guards against: `wait()` cannot return while the
+        // child blocks writing more than a pipe buffer (~64 KiB) of stderr
+        // that nobody is reading. 200 KB comfortably exceeds that.
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "yes errortext | head -c 200000 >&2; exit 4".to_string(),
+        ];
+        let mut r = spawn(&argv).expect("spawn itself succeeds");
+        let mut s = String::new();
+        let err = std::io::Read::read_to_string(&mut r, &mut s).unwrap_err();
+        assert!(format!("{err}").contains("exited with"), "got: {err}");
     }
 
     #[test]

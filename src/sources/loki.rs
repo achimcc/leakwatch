@@ -24,6 +24,7 @@ impl Loki {
         let curl = vec![
             "curl".to_string(),
             "-sG".to_string(),
+            "--fail".to_string(),
             "--max-time".to_string(),
             "120".to_string(),
             url,
