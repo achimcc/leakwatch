@@ -1,9 +1,9 @@
 //! Log files on disk that never pass through Loki — Caddy's access log,
 //! service-owned logs under /var/lib.
 
-use super::Source;
+use super::{LazyFiles, Source};
 use anyhow::Result;
-use std::io::{BufRead, Read};
+use std::io::BufRead;
 use std::path::PathBuf;
 
 pub struct Files {
@@ -29,7 +29,9 @@ impl Files {
                 }
                 continue;
             }
-            let (prefix, suffix) = name.split_once('*').expect("contains a star");
+            let Some((prefix, suffix)) = name.split_once('*') else {
+                continue;
+            };
             let Ok(entries) = std::fs::read_dir(parent) else {
                 continue;
             };
@@ -52,15 +54,8 @@ impl Source for Files {
         "files"
     }
     fn open(&self) -> Result<Box<dyn BufRead>> {
-        let mut readers: Vec<Box<dyn std::io::Read>> = Vec::new();
-        for f in self.files()? {
-            readers.push(Box::new(std::fs::File::open(f)?));
-        }
-        let chained = readers.into_iter().fold(
-            Box::new(std::io::empty()) as Box<dyn std::io::Read>,
-            |acc, r| Box::new(acc.chain(r)),
-        );
-        Ok(Box::new(std::io::BufReader::new(chained)))
+        let files = self.files()?;
+        Ok(Box::new(std::io::BufReader::new(LazyFiles::new(files))))
     }
     fn locate(&self, _line: &str) -> (String, String) {
         ("files".to_string(), self.globs.join(","))

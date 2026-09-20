@@ -1,9 +1,9 @@
 //! The Claude session transcripts on the workstation — where the five chat
 //! leaks actually landed. 1.5 GB in 972 files, so: streamed, never slurped.
 
-use super::Source;
+use super::{LazyFiles, Source};
 use anyhow::Result;
-use std::io::{BufRead, Read};
+use std::io::BufRead;
 use std::path::PathBuf;
 
 pub struct Sessions {
@@ -38,17 +38,10 @@ impl Source for Sessions {
         "sessions"
     }
     fn open(&self) -> Result<Box<dyn BufRead>> {
-        // Chain every transcript into one stream.
+        // Read every transcript as one stream, opening each file lazily —
+        // 972 files up front would cost 972 descriptors at once.
         let files = self.files()?;
-        let mut readers: Vec<Box<dyn std::io::Read>> = Vec::new();
-        for f in files {
-            readers.push(Box::new(std::fs::File::open(f)?));
-        }
-        let chained = readers.into_iter().fold(
-            Box::new(std::io::empty()) as Box<dyn std::io::Read>,
-            |acc, r| Box::new(acc.chain(r)),
-        );
-        Ok(Box::new(std::io::BufReader::new(chained)))
+        Ok(Box::new(std::io::BufReader::new(LazyFiles::new(files))))
     }
     fn locate(&self, _line: &str) -> (String, String) {
         ("sessions".to_string(), self.root.display().to_string())
