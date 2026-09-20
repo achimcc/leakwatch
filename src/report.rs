@@ -171,11 +171,7 @@ mod tests {
         let start = filler.len();
         let out = format(&finding(&line, (start, start + CANARY.len())));
         assert!(!out.contains(CANARY));
-        assert!(
-            out.len() < 400,
-            "Kontext nicht gekürzt: {} Zeichen",
-            out.len()
-        );
+        assert!(out.len() < 400, "context not trimmed: {} chars", out.len());
     }
 
     #[test]

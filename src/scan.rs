@@ -160,11 +160,11 @@ mod tests {
                 found.push(name.to_string())
             })
             .unwrap();
-        assert_eq!(n, 2, "zwei Zeilen gelesen");
+        assert_eq!(n, 2, "two lines read");
         assert_eq!(
             found,
             vec!["radarr-apikey"],
-            "über die Zeilengrenze gefunden"
+            "found across the line boundary"
         );
     }
 
@@ -210,7 +210,7 @@ mod tests {
                 found.push(name.to_string())
             })
             .unwrap();
-        assert_eq!(found, vec!["radarr-apikey"], "über drei Zeilen verloren");
+        assert_eq!(found, vec!["radarr-apikey"], "lost across three lines");
     }
 
     #[test]

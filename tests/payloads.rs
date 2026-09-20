@@ -61,5 +61,26 @@ fn value_split_across_lines() {
     scanner()
         .scan_stream(data.as_bytes(), &mut |_, _, _| hits += 1)
         .unwrap();
-    assert_eq!(hits, 1, "über die Zeilengrenze nicht gefunden");
+    assert_eq!(hits, 1, "not found across the line boundary");
+}
+
+/// The negative control. Without it, six green assertions are also compatible
+/// with a scanner that matches almost anything — the file would prove nothing
+/// about the payloads it names.
+#[test]
+fn the_same_shapes_without_the_key_yield_nothing() {
+    let other = "3c6e0b8a9c15224a8228b9a98ca1531d";
+    let s = scanner();
+    for line in [
+        format!("Started [systemd-run] curl -H 'X-Api-Key: {other}' http://x/"),
+        format!(r#"{{"request":{{"headers":{{"X-Api-Key":["{other}"]}}}}}}"#),
+        format!(r#"X-Emby-Authorization: MediaBrowser Client=Web, Token=\"{other}\""#),
+        format!(r#""trackers":["https://tracker.example/{other}/announce"]"#),
+        format!("GET /flows/-/?next=%2Fapi%2Fv3%2F%3Fapikey%3D{other} HTTP/1.1"),
+    ] {
+        assert!(
+            s.scan_line(&line).is_empty(),
+            "matched a line that carries a different value: {line}"
+        );
+    }
 }
