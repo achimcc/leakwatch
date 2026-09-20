@@ -48,8 +48,9 @@ OPTIONS:
                               default, it needs --files)
         --secrets-repo PATH  read secrets via sops from a homeserver-secrets
                               checkout instead of the local /run/secrets
-        --secrets-root PATH  override a runtime secrets root; repeatable
-                              (default: /run/secrets, /run/secrets/rendered)
+        --secrets-root PATH  an ADDITIONAL runtime secrets root to search
+                              alongside /run/secrets and
+                              /run/secrets/rendered; repeatable
         --ssh TARGET         reach loki over ssh (the workstation cannot
                               reach the zone address directly)
         --loki-base URL      override the Loki base URL
@@ -131,29 +132,34 @@ fn default_runtime_roots() -> Vec<PathBuf> {
     ]
 }
 
-fn load_secrets(repo: &Option<PathBuf>, roots: &[PathBuf]) -> Result<Vec<(String, String)>> {
+fn load_secrets(repo: &Option<PathBuf>, extra_roots: &[PathBuf]) -> Result<Vec<(String, String)>> {
     match repo {
         Some(r) => SopsSecrets { repo: r.clone() }.load(),
         None => {
-            let roots = if roots.is_empty() {
-                default_runtime_roots()
-            } else {
-                roots.to_vec()
-            };
+            // Additive, not a replacement: a caller who adds one root must not
+            // silently lose /run/secrets/rendered because they forgot to name
+            // it too.
+            let mut roots = default_runtime_roots();
+            roots.extend(extra_roots.iter().cloned());
             RuntimeSecrets { roots }.load()
         }
     }
 }
 
 fn load_config(path: &Option<PathBuf>) -> Result<Config> {
-    match path {
-        None => Ok(Config::default()),
+    let config = match path {
+        None => Config::default(),
         Some(p) => {
             let text =
                 std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
-            toml::from_str(&text).with_context(|| format!("parsing {}", p.display()))
+            toml::from_str(&text).with_context(|| format!("parsing {}", p.display()))?
         }
-    }
+    };
+    // Catch a canary exception here, before any source runs — it would
+    // otherwise surface much later as a plain "unused exception", pointing
+    // an operator at the wrong cause.
+    config.validate()?;
+    Ok(config)
 }
 
 fn parse_source_list(raw: &Option<String>, default: &[&str]) -> Vec<String> {

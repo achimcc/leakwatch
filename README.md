@@ -72,7 +72,8 @@ leakwatch sensor [OPTIONS]
                           for sensor — files is never picked by default)
     --secrets-repo PATH  read secrets via sops from a homeserver-secrets
                           checkout instead of the local /run/secrets
-    --secrets-root PATH  override a runtime secrets root; repeatable
+    --secrets-root PATH  an ADDITIONAL runtime secrets root, searched
+                          alongside the two defaults; repeatable
     --ssh TARGET         reach loki over ssh
     --loki-base URL      override the Loki base URL
     --files GLOB         a glob for the files source; repeatable
@@ -117,6 +118,11 @@ reason = "the token is intentionally public on the read-only dashboard"
 An exception without a reason fails to parse. One that matches nothing in
 a run that could have matched it is reported as a tool failure — an
 exception list that ages silently is worse than no list.
+
+An exception naming the canary (`leakwatch-canary`) is rejected outright,
+before any source runs: canary hits are filtered before they can become
+findings, so such an exception could never match and would fail every run
+as a stale exception instead — a message pointing at the wrong cause.
 
 ## Limits
 

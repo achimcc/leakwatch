@@ -38,6 +38,26 @@ impl Config {
             .map(|e| format!("{}/{}", e.secret, e.source))
             .collect()
     }
+
+    /// Canary hits never become findings — `main` filters them before they can —
+    /// so an exception naming the canary could never match, and an exception that
+    /// matches nothing fails the run. Catching it here points at the real cause
+    /// instead of at a stale-exception message.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(e) = self
+            .exceptions
+            .iter()
+            .find(|e| e.secret == crate::canary::CANARY_NAME)
+        {
+            anyhow::bail!(
+                "exception for {} ({}): canary hits are filtered before they become findings, \
+                 so this exception can never match and would fail every run",
+                e.secret,
+                e.source
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -49,15 +69,15 @@ mod tests {
         let c: Config = toml::from_str(
             r#"
             [[exception]]
-            secret = "leakwatch-canary"
-            source = "journal"
-            reason = "die eigene Positivkontrolle"
+            secret = "grafana-anon-token"
+            source = "loki"
+            reason = "the token is intentionally public on the read-only dashboard"
             "#,
         )
         .unwrap();
-        assert!(c.excepted("leakwatch-canary", "journal"));
-        assert!(!c.excepted("leakwatch-canary", "loki"));
-        assert!(!c.excepted("radarr-apikey", "journal"));
+        assert!(c.excepted("grafana-anon-token", "loki"));
+        assert!(!c.excepted("grafana-anon-token", "journal"));
+        assert!(!c.excepted("radarr-apikey", "loki"));
     }
 
     #[test]
@@ -85,5 +105,40 @@ mod tests {
         .unwrap();
         // After a run with no hit on `gone`:
         assert_eq!(c.unused(&[]), vec!["gone/journal".to_string()]);
+    }
+
+    #[test]
+    fn a_canary_exception_is_rejected() {
+        let c: Config = toml::from_str(&format!(
+            r#"
+            [[exception]]
+            secret = "{}"
+            source = "journal"
+            reason = "die eigene Positivkontrolle"
+            "#,
+            crate::canary::CANARY_NAME
+        ))
+        .unwrap();
+        let err = c
+            .validate()
+            .expect_err("an exception naming the canary must be rejected");
+        assert!(
+            err.to_string().contains(crate::canary::CANARY_NAME),
+            "error does not name the canary: {err}"
+        );
+    }
+
+    #[test]
+    fn a_config_without_a_canary_exception_validates() {
+        let c: Config = toml::from_str(
+            r#"
+            [[exception]]
+            secret = "grafana-anon-token"
+            source = "loki"
+            reason = "the token is intentionally public on the read-only dashboard"
+            "#,
+        )
+        .unwrap();
+        assert!(c.validate().is_ok());
     }
 }
