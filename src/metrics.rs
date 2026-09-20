@@ -15,25 +15,25 @@ fn escape_label(v: &str) -> String {
 
 pub fn render(hits: &[(String, String, u64)], canaries: &[(String, bool)], now: u64) -> String {
     let mut out = String::new();
-    out.push_str("# HELP leakwatch_treffer Geheimnisse an Stellen, an die sie nicht gehoeren\n");
-    out.push_str("# TYPE leakwatch_treffer gauge\n");
+    out.push_str("# HELP leakwatch_finding secrets in places they should not be\n");
+    out.push_str("# TYPE leakwatch_finding gauge\n");
     for (secret, source, n) in hits {
         let secret = escape_label(secret);
         let source = escape_label(source);
         out.push_str(&format!(
-            "leakwatch_treffer{{secret=\"{secret}\",quelle=\"{source}\"}} {n}\n"
+            "leakwatch_finding{{secret=\"{secret}\",source=\"{source}\"}} {n}\n"
         ));
     }
-    out.push_str("# HELP leakwatch_kanarie_gefunden Konnte der Lauf ueberhaupt finden?\n");
-    out.push_str("# TYPE leakwatch_kanarie_gefunden gauge\n");
+    out.push_str("# HELP leakwatch_canary_found did the run find anything at all?\n");
+    out.push_str("# TYPE leakwatch_canary_found gauge\n");
     for (source, ok) in canaries {
         let source = escape_label(source);
         out.push_str(&format!(
-            "leakwatch_kanarie_gefunden{{quelle=\"{source}\"}} {}\n",
+            "leakwatch_canary_found{{source=\"{source}\"}} {}\n",
             u8::from(*ok)
         ));
     }
-    out.push_str(&format!("leakwatch_lauf_zeitstempel {now}\n"));
+    out.push_str(&format!("leakwatch_run_timestamp {now}\n"));
     out
 }
 
@@ -48,7 +48,7 @@ mod tests {
             &[("journal".into(), true)],
             1758300000,
         );
-        assert!(text.contains("leakwatch_treffer"));
+        assert!(text.contains("leakwatch_finding"));
         assert!(text.contains("radarr-apikey"));
         assert!(!text.contains("abc123"));
     }
@@ -56,36 +56,36 @@ mod tests {
     #[test]
     fn a_failed_canary_is_zero_not_absent() {
         let text = render(&[], &[("loki".into(), false)], 1758300000);
-        assert!(text.contains("leakwatch_kanarie_gefunden{quelle=\"loki\"} 0"));
+        assert!(text.contains("leakwatch_canary_found{source=\"loki\"} 0"));
     }
 
     #[test]
     fn a_label_value_with_quotes_backslashes_and_a_newline_stays_one_line() {
         let nasty = "weird\"name\\with\nnewline".to_string();
         let text = render(&[(nasty, "journal".into(), 1)], &[], 1758300000);
-        let treffer_line = text
+        let finding_line = text
             .lines()
-            .find(|l| l.starts_with("leakwatch_treffer{"))
-            .expect("no leakwatch_treffer line rendered");
+            .find(|l| l.starts_with("leakwatch_finding{"))
+            .expect("no leakwatch_finding line rendered");
         // The escaped newline must not have split the metric onto a second line.
         assert!(
-            treffer_line.contains("\\n"),
-            "newline not escaped: {treffer_line}"
+            finding_line.contains("\\n"),
+            "newline not escaped: {finding_line}"
         );
         assert!(
-            treffer_line.contains("\\\""),
-            "quote not escaped: {treffer_line}"
+            finding_line.contains("\\\""),
+            "quote not escaped: {finding_line}"
         );
         assert!(
-            treffer_line.contains("\\\\"),
-            "backslash not escaped: {treffer_line}"
+            finding_line.contains("\\\\"),
+            "backslash not escaped: {finding_line}"
         );
         // Quoting stays balanced: exactly two UNESCAPED double quotes bound each
-        // label value (secret="..." and quelle="...").
-        let unescaped_quotes = treffer_line
+        // label value (secret="..." and source="...").
+        let unescaped_quotes = finding_line
             .char_indices()
-            .filter(|&(i, c)| c == '"' && !treffer_line.as_bytes()[..i].ends_with(b"\\"))
+            .filter(|&(i, c)| c == '"' && !finding_line.as_bytes()[..i].ends_with(b"\\"))
             .count();
-        assert_eq!(unescaped_quotes, 4, "quoting not balanced: {treffer_line}");
+        assert_eq!(unescaped_quotes, 4, "quoting not balanced: {finding_line}");
     }
 }

@@ -140,8 +140,7 @@ mod tests {
 
     #[test]
     fn finds_a_value_with_no_delimiters_around_it() {
-        // Kein Whitespace, keine Grenze: genau das, woran ein Tokenizer
-        // scheitern würde.
+        // No whitespace, no boundary: exactly where a tokenizer would fail.
         let hits = scanner().scan_line("xxxabc123def456ghi789yyy");
         assert_eq!(hits.len(), 1);
     }
@@ -187,7 +186,7 @@ mod tests {
 
     #[test]
     fn empty_and_whitespace_secrets_are_refused() {
-        // Ein leerer Wert träfe jede Zeile; ein Wert aus Leerzeichen fast jede.
+        // An empty value would match every line; a value of only whitespace would match almost every line.
         let s = Scanner::new(vec![("leer".into(), String::new())]).unwrap();
         assert!(s.scan_line("irgendwas").is_empty());
     }

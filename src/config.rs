@@ -99,7 +99,7 @@ mod tests {
             [[exception]]
             secret = "gone"
             source = "journal"
-            reason = "trifft nichts mehr"
+            reason = "no longer matches anything"
             "#,
         )
         .unwrap();
@@ -114,7 +114,7 @@ mod tests {
             [[exception]]
             secret = "{}"
             source = "journal"
-            reason = "die eigene Positivkontrolle"
+            reason = "the built-in positive control"
             "#,
             crate::canary::CANARY_NAME
         ))

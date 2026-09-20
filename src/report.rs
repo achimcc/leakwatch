@@ -9,7 +9,7 @@
 //! redact the line field and prevent accidental leaks from `{:?}` or `dbg!` calls.
 
 /// What replaces a secret in any output.
-pub const MASK: &str = "<TREFFER>";
+pub const MASK: &str = "<REDACTED>";
 
 /// How much context is kept on either side of a hit.
 const CONTEXT: usize = 120;
@@ -122,7 +122,7 @@ mod tests {
         let line = format!("curl -H 'X-Api-Key: {CANARY}' http://x/");
         let start = line.find(CANARY).unwrap();
         let out = redact(&line, &[(start, start + CANARY.len())]);
-        assert_eq!(out, "curl -H 'X-Api-Key: <TREFFER>' http://x/");
+        assert_eq!(out, "curl -H 'X-Api-Key: <REDACTED>' http://x/");
     }
 
     #[test]
@@ -130,10 +130,7 @@ mod tests {
         let line = format!("curl -H 'X-Api-Key: {CANARY}' http://x/");
         let start = line.find(CANARY).unwrap();
         let out = format(&finding(&line, (start, start + CANARY.len())));
-        assert!(
-            !out.contains(CANARY),
-            "der Wert steht in der Ausgabe: {out}"
-        );
+        assert!(!out.contains(CANARY), "value appears in output: {out}");
     }
 
     #[test]
@@ -152,7 +149,7 @@ mod tests {
         let a = (0, CANARY.len());
         let b = (line.rfind(CANARY).unwrap(), line.len());
         let out = redact(&line, &[a, b]);
-        assert_eq!(out, "<TREFFER> middle <TREFFER>");
+        assert_eq!(out, "<REDACTED> middle <REDACTED>");
         assert!(!out.contains(CANARY));
     }
 
@@ -161,7 +158,7 @@ mod tests {
         let line = format!("Schlüssel läuft: {CANARY} — Ende");
         let start = line.find(CANARY).unwrap();
         let out = redact(&line, &[(start, start + CANARY.len())]);
-        assert_eq!(out, "Schlüssel läuft: <TREFFER> — Ende");
+        assert_eq!(out, "Schlüssel läuft: <REDACTED> — Ende");
     }
 
     #[test]
@@ -181,7 +178,7 @@ mod tests {
         let end = start + CANARY.len();
         // Two spans over the same secret with different boundaries.
         let out = redact(&line, &[(start, end), (start + 4, end)]);
-        assert_eq!(out, "head <TREFFER> tail");
+        assert_eq!(out, "head <REDACTED> tail");
         assert!(
             !out.contains(&CANARY[4..]),
             "tail of the secret survived: {out}"
@@ -192,7 +189,7 @@ mod tests {
     fn redact_merges_touching_spans() {
         let line = "aaaabbbb".to_string();
         let out = redact(&line, &[(0, 4), (4, 8)]);
-        assert_eq!(out, "<TREFFER>");
+        assert_eq!(out, "<REDACTED>");
     }
 
     #[test]

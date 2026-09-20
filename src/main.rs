@@ -321,19 +321,19 @@ fn execute(
             Ok((lines_read, canary_found)) => {
                 if !canary_found {
                     state.out_lines.push(format!(
-                        "FEHLER: {name}: Kanarie nicht gefunden — der Lauf kann nichts belegen"
+                        "ERROR: {name}: canary not found — this run proves nothing"
                     ));
                     tool_failure = true;
                 } else if canary::source_was_silent(lines_read) {
                     state.out_lines.push(format!(
-                        "FEHLER: {name}: nur die Kanarie kam an — die Quelle selbst war still"
+                        "ERROR: {name}: only the canary arrived — the source itself was silent"
                     ));
                     tool_failure = true;
                 }
                 canaries.push((name, canary_found));
             }
             Err(e) => {
-                state.out_lines.push(format!("FEHLER: {name}: {e}"));
+                state.out_lines.push(format!("ERROR: {name}: {e}"));
                 tool_failure = true;
                 canaries.push((name, false));
             }
@@ -346,7 +346,7 @@ fn execute(
         for u in &unused {
             state
                 .out_lines
-                .push(format!("FEHLER: Ausnahme trifft nichts mehr: {u}"));
+                .push(format!("ERROR: exception no longer matches anything: {u}"));
         }
         tool_failure = true;
     }

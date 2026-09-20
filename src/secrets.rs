@@ -92,7 +92,7 @@ fn walk_yaml(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
 /// Non-scalar leaves (empty mappings, nulls) are skipped.
 /// The top-level `sops` key is skipped structurally.
 pub fn parse_sops_yaml(text: &str) -> Result<Vec<(String, String)>> {
-    let value: serde_yaml::Value = serde_yaml::from_str(text)?;
+    let value: serde_norway::Value = serde_norway::from_str(text)?;
 
     let mut out = Vec::new();
     collect_scalars(&value, String::new(), &mut out);
@@ -102,12 +102,12 @@ pub fn parse_sops_yaml(text: &str) -> Result<Vec<(String, String)>> {
 /// Recursively collect scalar leaves from a YAML value.
 /// For mappings, join keys with `.`. For sequences, skip (not used in sops files).
 /// The top-level `sops` key is skipped.
-fn collect_scalars(value: &serde_yaml::Value, prefix: String, out: &mut Vec<(String, String)>) {
+fn collect_scalars(value: &serde_norway::Value, prefix: String, out: &mut Vec<(String, String)>) {
     match value {
-        serde_yaml::Value::Mapping(map) => {
+        serde_norway::Value::Mapping(map) => {
             for (k, v) in map.iter() {
                 let key_str = match k {
-                    serde_yaml::Value::String(s) => s.clone(),
+                    serde_norway::Value::String(s) => s.clone(),
                     _ => continue,
                 };
 
@@ -125,22 +125,24 @@ fn collect_scalars(value: &serde_yaml::Value, prefix: String, out: &mut Vec<(Str
                 collect_scalars(v, new_prefix, out);
             }
         }
-        serde_yaml::Value::String(s) => {
+        serde_norway::Value::String(s) => {
             if !prefix.is_empty() {
                 out.push((prefix, s.clone()));
             }
         }
-        serde_yaml::Value::Number(n) => {
+        serde_norway::Value::Number(n) => {
             if !prefix.is_empty() {
                 out.push((prefix, n.to_string()));
             }
         }
-        serde_yaml::Value::Bool(b) => {
+        serde_norway::Value::Bool(b) => {
             if !prefix.is_empty() {
                 out.push((prefix, b.to_string()));
             }
         }
-        serde_yaml::Value::Null | serde_yaml::Value::Sequence(_) | serde_yaml::Value::Tagged(_) => {
+        serde_norway::Value::Null
+        | serde_norway::Value::Sequence(_)
+        | serde_norway::Value::Tagged(_) => {
             // Skip nulls, sequences, and tagged values
         }
     }
@@ -151,7 +153,7 @@ fn collect_scalars(value: &serde_yaml::Value, prefix: String, out: &mut Vec<(Str
 /// Ghostfolio made.
 pub fn skipped_short(all: usize, used: usize) -> String {
     format!(
-        "{} von {all} Geheimnissen sind kürzer als die Mindestlänge und werden NICHT gesucht",
+        "{} of {all} secrets are shorter than the minimum length and are not searched",
         all.saturating_sub(used)
     )
 }
@@ -163,7 +165,7 @@ pub fn skipped_short(all: usize, used: usize) -> String {
 pub fn multiline_note(values: &[(String, String)]) -> Option<String> {
     let n = values.iter().filter(|(_, v)| v.contains('\n')).count();
     (n > 0).then(|| {
-        format!("{n} Muster sind mehrzeilig und werden nur gefunden, wenn sie vollständig dastehen")
+        format!("{n} patterns span multiple lines and are found only if they appear in full")
     })
 }
 
@@ -192,8 +194,8 @@ mod tests {
 
     #[test]
     fn runtime_trims_only_the_trailing_newline() {
-        // Ein Passwort darf innen Leerzeichen haben; nur der abschliessende
-        // Zeilenumbruch, den sops-nix anhaengt, faellt weg.
+        // A password may contain spaces inside; only the trailing newline
+        // that sops-nix appends is removed.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("pw"), "  spaces inside  \n").unwrap();
         let s = RuntimeSecrets {
@@ -215,8 +217,8 @@ mod tests {
 
     #[test]
     fn runtime_reports_an_empty_root_as_an_error() {
-        // Ein leeres /run/secrets heisst: der Lauf hat KEINE Muster. Das ist
-        // ein Werkzeugfehler, kein sauberes Ergebnis.
+        // An empty /run/secrets means: the run has NO patterns. That is a
+        // tool error, not a clean result.
         let dir = tempfile::tempdir().unwrap();
         let s = RuntimeSecrets {
             roots: vec![dir.path().to_path_buf()],
@@ -227,7 +229,7 @@ mod tests {
     #[test]
     fn skipped_short_names_the_gap() {
         let msg = skipped_short(200, 186);
-        assert!(msg.contains("14"), "nennt die Zahl nicht: {msg}");
+        assert!(msg.contains("14"), "does not name the count: {msg}");
     }
 
     #[test]
@@ -248,7 +250,7 @@ mod tests {
         // key material in as a secret.
         let yaml = "key: abc123def456\nsops:\n  age:\n    - recipient: xyz\n";
         let got = parse_sops_yaml(yaml).unwrap();
-        assert_eq!(got.len(), 1, "sops-Metadaten mitgelesen: {got:?}");
+        assert_eq!(got.len(), 1, "sops metadata leaked in: {got:?}");
         assert_eq!(got[0].0, "key");
     }
 
