@@ -18,11 +18,26 @@ pub fn check(scanner: &Scanner) -> bool {
         .is_empty()
 }
 
-/// Mix one canary line into a stream, so the whole path — adapter, scanner,
-/// formatter — is exercised on real input.
+/// Mix one canary line into a stream, so the scanner and the formatter are
+/// exercised on real input.
+///
+/// WHAT THIS DOES NOT COVER: the canary line comes from memory, chained ahead
+/// of the source. A source whose command failed and produced no lines at all
+/// still yields a found canary. Proving the SOURCE delivered something is the
+/// job of the line count — see [`source_was_silent`].
 pub fn inject<R: BufRead>(r: R) -> impl BufRead {
     let line = format!("leakwatch-probe {CANARY_VALUE}\n");
     std::io::BufReader::new(std::io::Cursor::new(line.into_bytes()).chain(r))
+}
+
+/// Did the source deliver anything of its own?
+///
+/// `scan_stream` returns the number of lines it read, and exactly one of those
+/// is the canary this module injected. A count of one therefore means the
+/// source itself was silent — which, for a command-backed adapter, is a tool
+/// failure wearing the costume of a clean result.
+pub fn source_was_silent(lines_read: u64) -> bool {
+    lines_read <= 1
 }
 
 #[cfg(test)]
@@ -42,7 +57,7 @@ mod tests {
     #[test]
     fn check_fails_when_the_canary_is_missing_from_the_patterns() {
         let s = Scanner::new(vec![("other".into(), "abc123def456".into())]).unwrap();
-        assert!(!check(&s), "ein Scanner ohne Kanarie darf nicht bestehen");
+        assert!(!check(&s), "a scanner without the canary must not pass");
     }
 
     #[test]
@@ -57,7 +72,24 @@ mod tests {
 
     #[test]
     fn the_canary_is_long_enough_to_be_searched_for() {
-        // Kürzer als MIN_LEN in scan.rs, und die Kontrolle prüfte nichts.
+        // Shorter than MIN_LEN in scan.rs would make the control check nothing.
         assert!(CANARY_VALUE.len() >= 16);
+    }
+
+    #[test]
+    fn source_was_silent_when_zero_lines_read() {
+        assert!(source_was_silent(0));
+    }
+
+    #[test]
+    fn source_was_silent_when_only_the_canary_arrived() {
+        // Exactly one line — the canary we injected.
+        assert!(source_was_silent(1));
+    }
+
+    #[test]
+    fn source_was_not_silent_when_multiple_lines_read() {
+        // At least one line from the source itself.
+        assert!(!source_was_silent(2));
     }
 }
