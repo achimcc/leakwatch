@@ -36,9 +36,9 @@ tool failure, not as a clean result.
 ```console
 $ leakwatch scan --source files --files /var/log/caddy/*.log
 test-secret  files  /var/log/caddy/access.log  1758300012
-  GET /api?apikey=<TREFFER> HTTP/1.1
+  GET /api?apikey=<REDACTED> HTTP/1.1
   → just rotor-leser test-secret
-2 von 214 Geheimnissen sind kürzer als die Mindestlänge und werden NICHT gesucht
+2 of 214 secrets are shorter than the minimum length and are not searched
 ```
 
 A finding never prints the value — only the secret's name, where it was
@@ -51,8 +51,8 @@ a suppressed alert.
 
 | Source | What | Reads |
 |---|---|---|
-| `journal` | the host's own journal, or a guest's via `journalctl -M` | locally, streamed |
-| `loki` | the aggregated log store, which also proves whether the regex mask in `observability.nix` actually holds | `curl`, optionally wrapped in `ssh` — the workstation cannot reach the zone address directly |
+| `journal` | the host's own journal, or one or more guests' via `journalctl -M` (`--machine`, repeatable) | locally, streamed, or over `ssh` |
+| `loki` | the aggregated log store, which also proves whether a log-scrubbing regex mask elsewhere actually holds | `curl`, optionally wrapped in `ssh` — Loki commonly listens on an address the machine running leakwatch cannot reach directly |
 | `sessions` | Claude session transcripts, where the household's real chat leaks actually landed | streamed, files opened lazily (972 files would cost 972 descriptors at once) |
 | `files` | log files that never pass through Loki, e.g. Caddy's access log | glob patterns, `--files`, repeatable; not selected by default because a guessed default path is not a finding |
 
@@ -70,11 +70,17 @@ leakwatch sensor [OPTIONS]
     --source LIST        comma-separated: journal,loki,sessions,files
                           (default: journal,loki,sessions for scan, journal
                           for sensor — files is never picked by default)
+    --machine NAME       scan a guest's journal via `journalctl -M NAME`
+                          instead of the host's own; repeatable, several
+                          guests can be scanned in one run
     --secrets-repo PATH  read secrets via sops from a homeserver-secrets
                           checkout instead of the local /run/secrets
     --secrets-root PATH  an ADDITIONAL runtime secrets root, searched
                           alongside the two defaults; repeatable
-    --ssh TARGET         reach loki over ssh
+    --ssh TARGET         reach the journal or loki source over ssh (for a
+                          machine the tool does not run on itself);
+                          combine with --machine to reach a guest on a
+                          remote host
     --loki-base URL      override the Loki base URL
     --files GLOB         a glob for the files source; repeatable
     --sessions-root PATH override the sessions root
@@ -89,10 +95,11 @@ same pipeline from a systemd timer and additionally writes a Prometheus
 textfile metric — the same shape as this house's other sensors
 (gast-speicher, dns-abgleich, sicherung, groundtruth): a oneshot, written
 atomically (temp file, then renamed), so node-exporter's textfile collector
-never reads a half-written file. `leakwatch_treffer` never carries a value,
-only a secret's name and its source; `leakwatch_kanarie_gefunden` is `0`,
-not absent, when the canary did not come back for a source — an absent
-series and a healthy one look the same to an alerting rule, a zero does not.
+never reads a half-written file. `leakwatch_finding{secret,source}` never
+carries a value, only a secret's name and its source; `leakwatch_canary_found{source}`
+is `0`, not absent, when the canary did not come back for a source — an
+absent series and a healthy one look the same to an alerting rule, a zero
+does not. `leakwatch_run_timestamp` names when the run happened.
 
 ### Exit status
 
@@ -134,9 +141,10 @@ as a stale exception instead — a message pointing at the wrong cause.
   `-----BEGIN PRIVATE KEY-----` would then match every PEM file. A run
   states how many of the loaded values are multiline.
 - `sessions` and `files` read the local filesystem only; `journal` reads
-  the local host or a named guest via `journalctl -M`; only `loki` can be
-  reached over `ssh`. Scanning a remote host's journal or files means
-  running leakwatch on that host.
+  the local host or one or more named guests via `journalctl -M`
+  (`--machine`); `journal` and `loki` can both be reached over `ssh`.
+  Scanning a remote host's `sessions` or `files` means running leakwatch on
+  that host.
 - The canary proves a source delivered lines, not that a specific line was
   read correctly — a source that silently drops a small fraction of its
   output can still look healthy.

@@ -14,7 +14,7 @@ fn scanner() -> Scanner {
 #[test]
 fn systemd_run_one_liner() {
     let line = format!(
-        "Started [systemd-run] /run/current-system/sw/bin/curl -H 'X-Api-Key: {KEY}' http://10.0.20.11:7878/api/v3/movie"
+        "Started [systemd-run] /run/current-system/sw/bin/curl -H 'X-Api-Key: {KEY}' http://192.0.2.11:7878/api/v3/movie"
     );
     assert_eq!(scanner().scan_line(&line).len(), 1);
 }

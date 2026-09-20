@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn loki_builds_a_direct_curl_command() {
         let l = loki::Loki {
-            base: "http://10.0.20.12:3100".into(),
+            base: "http://192.0.2.12:3100".into(),
             via_ssh: None,
             since: "7d".into(),
         };
@@ -210,13 +210,13 @@ mod tests {
     #[test]
     fn loki_wraps_the_call_in_ssh_when_asked() {
         let l = loki::Loki {
-            base: "http://10.0.20.12:3100".into(),
-            via_ssh: Some("root@server.taile9e283.ts.net".into()),
+            base: "http://192.0.2.12:3100".into(),
+            via_ssh: Some("root@host.example.com".into()),
             since: "7d".into(),
         };
         let cmd = l.command();
         assert_eq!(cmd[0], "ssh");
-        assert!(cmd.contains(&"root@server.taile9e283.ts.net".to_string()));
+        assert!(cmd.contains(&"root@host.example.com".to_string()));
         assert!(
             cmd.iter().any(|a| a.contains("--fail")),
             "the ssh-wrapped curl call must carry --fail too: {cmd:?}"
@@ -243,11 +243,11 @@ mod tests {
         let j = journal::Journal {
             machine: None,
             since: "7d".into(),
-            via_ssh: Some("root@server.taile9e283.ts.net".into()),
+            via_ssh: Some("root@host.example.com".into()),
         };
         let cmd = j.command();
         assert_eq!(cmd[0], "ssh");
-        assert!(cmd.contains(&"root@server.taile9e283.ts.net".to_string()));
+        assert!(cmd.contains(&"root@host.example.com".to_string()));
         assert!(
             cmd.iter().any(|a| a.contains("journalctl")),
             "the ssh-wrapped journalctl call must contain journalctl: {cmd:?}"
@@ -259,11 +259,11 @@ mod tests {
         let j = journal::Journal {
             machine: Some("media-01".into()),
             since: "7d".into(),
-            via_ssh: Some("root@server.taile9e283.ts.net".into()),
+            via_ssh: Some("root@host.example.com".into()),
         };
         let cmd = j.command();
         assert_eq!(cmd[0], "ssh");
-        assert!(cmd.contains(&"root@server.taile9e283.ts.net".to_string()));
+        assert!(cmd.contains(&"root@host.example.com".to_string()));
         // The joined command must contain both -M and the guest name
         let joined = cmd.join(" ");
         assert!(
@@ -289,11 +289,11 @@ mod tests {
         let remote = journal::Journal {
             machine: Some("media-01".into()),
             since: "7d".into(),
-            via_ssh: Some("root@server.taile9e283.ts.net".into()),
+            via_ssh: Some("root@host.example.com".into()),
         };
         let (_, remote_loc) = remote.locate("test line");
         assert_eq!(
-            remote_loc, "root@server.taile9e283.ts.net:media-01",
+            remote_loc, "root@host.example.com:media-01",
             "remote should include target and machine"
         );
     }

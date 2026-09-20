@@ -1,9 +1,9 @@
-//! Loki, which also measures whether the regex mask in observability.nix
+//! Loki, which also measures whether a log-scrubbing regex mask elsewhere
 //! actually holds.
 //!
-//! THE AUDIT REACHES LOKI ONLY OVER SSH: the workstation cannot reach
-//! 10.0.20.12:3100 — zone addresses are out of reach without a tailscale
-//! route. Same pattern as `gestalt`: the answer comes over `ssh … |`.
+//! LOKI IS OFTEN ONLY REACHABLE OVER SSH: it commonly listens on an
+//! internal address a workstation cannot reach directly. Same pattern as
+//! `gestalt`: the answer comes over `ssh … |`.
 
 use super::{Source, spawn};
 use anyhow::Result;

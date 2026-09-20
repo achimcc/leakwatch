@@ -46,15 +46,20 @@ OPTIONS:
                               (default: journal,loki,sessions for scan,
                               journal for sensor — files is never picked by
                               default, it needs --files)
+        --machine NAME       scan a guest's journal via `journalctl -M NAME`
+                              instead of the host's own; repeatable, several
+                              guests can be scanned in one run
         --secrets-repo PATH  read secrets via sops from a homeserver-secrets
                               checkout instead of the local /run/secrets
         --secrets-root PATH  an ADDITIONAL runtime secrets root to search
                               alongside /run/secrets and
                               /run/secrets/rendered; repeatable
-        --ssh TARGET         reach loki over ssh (the workstation cannot
-                              reach the zone address directly)
+        --ssh TARGET         reach the journal or loki source over ssh (for
+                              a machine the tool does not run on itself);
+                              combine with --machine to reach a guest on a
+                              remote host
         --loki-base URL      override the Loki base URL
-                              (default: http://10.0.20.12:3100)
+                              (default: http://localhost:3100)
         --files GLOB         a glob for the files source; repeatable
         --sessions-root PATH override the sessions root
                               (default: ~/.claude/projects)
@@ -71,7 +76,7 @@ EXIT STATUS:
        exceptions, or an adapter error
 ";
 
-const DEFAULT_LOKI_BASE: &str = "http://10.0.20.12:3100";
+const DEFAULT_LOKI_BASE: &str = "http://localhost:3100";
 const DEFAULT_SENSOR_OUTPUT: &str = "/var/lib/node-exporter/leakwatch.prom";
 
 #[derive(Default)]
@@ -79,6 +84,7 @@ struct Args {
     command: String,
     since: Option<String>,
     sources: Option<String>,
+    machine: Vec<String>,
     secrets_repo: Option<PathBuf>,
     secrets_root: Vec<PathBuf>,
     ssh: Option<String>,
@@ -97,6 +103,7 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
         match arg {
             Long("since") => a.since = Some(p.value()?.string()?),
             Long("source") => a.sources = Some(p.value()?.string()?),
+            Long("machine") => a.machine.push(p.value()?.string()?),
             Long("secrets-repo") => a.secrets_repo = Some(p.value()?.into()),
             Long("secrets-root") => a.secrets_root.push(p.value()?.into()),
             Long("ssh") => a.ssh = Some(p.value()?.string()?),
@@ -182,15 +189,28 @@ fn build_sources(
     loki_base: &str,
     files: &[String],
     sessions_root: &Option<PathBuf>,
+    machines: &[String],
 ) -> Result<Vec<Box<dyn Source>>> {
     let mut out: Vec<Box<dyn Source>> = Vec::new();
     for n in names {
         match n.as_str() {
-            "journal" => out.push(Box::new(Journal {
-                machine: None,
-                since: since.to_string(),
-                via_ssh: ssh.clone(),
-            })),
+            "journal" => {
+                if machines.is_empty() {
+                    out.push(Box::new(Journal {
+                        machine: None,
+                        since: since.to_string(),
+                        via_ssh: ssh.clone(),
+                    }));
+                } else {
+                    for m in machines {
+                        out.push(Box::new(Journal {
+                            machine: Some(m.clone()),
+                            since: since.to_string(),
+                            via_ssh: ssh.clone(),
+                        }));
+                    }
+                }
+            }
             "loki" => out.push(Box::new(Loki {
                 base: loki_base.to_string(),
                 via_ssh: ssh.clone(),
@@ -425,6 +445,7 @@ fn run_scan(a: &Args) -> Result<Outcome> {
         &loki_base,
         &a.files,
         &a.sessions_root,
+        &a.machine,
     )?;
     let secrets = load_secrets(&a.secrets_repo, &a.secrets_root)?;
     execute(sources, secrets, &config)
@@ -445,6 +466,7 @@ fn run_sensor(a: &Args) -> Result<(Outcome, PathBuf)> {
         &loki_base,
         &a.files,
         &a.sessions_root,
+        &a.machine,
     )?;
     let secrets = load_secrets(&a.secrets_repo, &a.secrets_root)?;
     let outcome = execute(sources, secrets, &config)?;
@@ -489,5 +511,59 @@ fn main() -> ExitCode {
             eprintln!("leakwatch: {e:#}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_machine_yields_the_host_journal() {
+        let sources = build_sources(
+            &["journal".to_string()],
+            "7d",
+            &None,
+            "http://localhost:3100",
+            &[],
+            &None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].locate("line").1, "local");
+    }
+
+    #[test]
+    fn one_machine_yields_one_guest_source() {
+        let sources = build_sources(
+            &["journal".to_string()],
+            "7d",
+            &None,
+            "http://localhost:3100",
+            &[],
+            &None,
+            &["media-01".to_string()],
+        )
+        .unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].locate("line").1, "media-01");
+    }
+
+    #[test]
+    fn two_machines_yield_two_guest_sources() {
+        let sources = build_sources(
+            &["journal".to_string()],
+            "7d",
+            &None,
+            "http://localhost:3100",
+            &[],
+            &None,
+            &["media-01".to_string(), "jelly-01".to_string()],
+        )
+        .unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].locate("line").1, "media-01");
+        assert_eq!(sources[1].locate("line").1, "jelly-01");
     }
 }
