@@ -21,9 +21,15 @@ const MIN_LEN: usize = 8;
 
 impl Scanner {
     pub fn new(secrets: Vec<(String, String)>) -> Result<Scanner> {
+        // Trim once: use the trimmed value for both the length check and the
+        // pattern. A secret read from a file normally carries a trailing
+        // newline; that newline must not go into the pattern, or it can never
+        // match anything — BufRead::lines() strips line terminators from every
+        // scanned line. Spaces INSIDE the value are preserved.
         let usable: Vec<(String, String)> = secrets
             .into_iter()
-            .filter(|(_, v)| v.trim().len() >= MIN_LEN)
+            .map(|(n, v)| (n, v.trim().to_string()))
+            .filter(|(_, v)| v.len() >= MIN_LEN)
             .collect();
         let names: Vec<String> = usable.iter().map(|(n, _)| n.clone()).collect();
         let values: Vec<String> = usable.into_iter().map(|(_, v)| v).collect();
@@ -65,13 +71,19 @@ impl Scanner {
             let line = line.context("reading a line")?;
             lines += 1;
 
-            // The joined window catches a value split by the newline. Only
-            // hits that actually CROSS the seam are reported here; hits that
-            // sit entirely in the new line are reported below, so nothing is
-            // counted twice.
-            if !carry.is_empty() {
-                let seam = carry.len();
-                let joined = format!("{carry}{line}");
+            let seam = carry.len();
+            let joined = if carry.is_empty() {
+                line.clone()
+            } else {
+                format!("{carry}{line}")
+            };
+
+            // Only hits that actually CROSS the seam come from the window;
+            // hits sitting entirely in the new line are reported by the plain
+            // scan below, and hits entirely inside `carry` were reported when
+            // that text was the current line. Otherwise every hit near a line
+            // end is counted twice.
+            if seam > 0 {
                 for (name, (start, end)) in self.scan_line(&joined) {
                     if start < seam && end > seam {
                         on_hit(&name, &joined, (start, end));
@@ -83,9 +95,11 @@ impl Scanner {
                 on_hit(&name, &line, span);
             }
 
-            let tail = line.len().saturating_sub(self.longest);
-            let tail = floor_char_boundary(&line, tail);
-            carry = line[tail..].to_string();
+            // Carry the tail of the JOINED text, not of this line alone —
+            // otherwise a secret spanning three lines loses its head.
+            let tail = joined.len().saturating_sub(self.longest);
+            let tail = floor_char_boundary(&joined, tail);
+            carry = joined[tail..].to_string();
         }
         Ok(lines)
     }
@@ -183,5 +197,33 @@ mod tests {
         // "pw42" is 4 bytes, below MIN_LEN — it must not be counted.
         let s = scanner();
         assert_eq!(s.pattern_count(), 1);
+    }
+
+    #[test]
+    fn finds_a_value_split_across_three_lines() {
+        // Middle line shorter than the longest secret: the carry must keep
+        // context from before it, or this hit vanishes silently.
+        let data = "prefix abc123\ndef456\nghi789 suffix\n";
+        let mut found = Vec::new();
+        scanner()
+            .scan_stream(data.as_bytes(), &mut |name, _l, _s| {
+                found.push(name.to_string())
+            })
+            .unwrap();
+        assert_eq!(found, vec!["radarr-apikey"], "über drei Zeilen verloren");
+    }
+
+    #[test]
+    fn a_value_with_a_trailing_newline_is_still_findable() {
+        // The normal shape of a secret read from a file.
+        let s = Scanner::new(vec![("k".into(), "abc123def456ghi789\n".into())]).unwrap();
+        assert_eq!(s.scan_line("x abc123def456ghi789 y").len(), 1);
+    }
+
+    #[test]
+    fn spaces_inside_a_value_are_preserved() {
+        let s = Scanner::new(vec![("pw".into(), "  pass word here  ".into())]).unwrap();
+        assert_eq!(s.scan_line("login=pass word here;").len(), 1);
+        assert_eq!(s.scan_line("login=passwordhere;").len(), 0);
     }
 }
