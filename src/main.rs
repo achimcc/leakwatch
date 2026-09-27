@@ -21,6 +21,7 @@ use leakwatch::sources::files::Files;
 use leakwatch::sources::journal::Journal;
 use leakwatch::sources::loki::Loki;
 use leakwatch::sources::sessions::Sessions;
+use leakwatch::variants::{self, Kind};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -32,12 +33,18 @@ USAGE:
     leakwatch scan   [OPTIONS]
     leakwatch sensor [OPTIONS]
 
-scan runs a full audit and prints every finding as text. sensor runs the
-same audit and additionally writes a Prometheus textfile metric, meant for
-a timer-driven oneshot (the gast-speicher/dns-abgleich/sicherung pattern).
+scan runs a full audit and prints every finding as text, with the line
+around it redacted. sensor runs the same audit, prints findings WITHOUT any
+line content (name, source, location, time — its stdout is a journal), and
+additionally writes a Prometheus textfile metric, meant for a timer-driven
+oneshot (the gast-speicher/dns-abgleich/sicherung pattern).
 
-Every run injects its own canary value and proves, per adapter, that the
-canary was found AND that the adapter delivered more than just the canary.
+Every value is searched in plaintext and in its encoded spellings (Base64,
+URL-safe Base64, percent-encoding, JSON escapes, hex; single lines of a
+multi-line value); a report names the spelling, e.g. `name[b64]`.
+
+Every run injects its own canary in every spelling and proves, per adapter,
+that each came back AND that the adapter delivered more than the canary.
 A run that cannot prove this is a tool failure, never a clean result.
 
 OPTIONS:
@@ -239,50 +246,93 @@ struct RunState {
     matched_pairs: HashSet<(String, String)>,
     counts: HashMap<(String, String), u64>,
     findings: usize,
+    /// Print the redacted line around a finding (`scan`) or only name,
+    /// source, location and time (`sensor`, whose stdout is the journal).
+    with_context: bool,
 }
 
-/// Scan one source. Returns the number of lines read and whether the
-/// injected canary was found in the stream.
+/// What one source's scan established.
+struct SourceResult {
+    /// Lines the source itself delivered — the probes not counted.
+    own_lines: u64,
+    /// Kinds whose probe did not come back. Empty: the canary was found in
+    /// every spelling.
+    missing: Vec<&'static str>,
+}
+
+/// Scan one source.
 fn process_source(
     source: &dyn Source,
     scanner: &Scanner,
+    probes: &[canary::Probe],
     config: &Config,
     now: &str,
     state: &mut RunState,
-) -> Result<(u64, bool)> {
+) -> Result<SourceResult> {
     let name = source.name().to_string();
-    let mut canary_found = false;
+    let mut proven = vec![false; probes.len()];
     let reader = source.open()?;
-    let wrapped = canary::inject(reader);
-    let lines = scanner.scan_stream(wrapped, &mut |secret, line, span| {
-        if secret == canary::CANARY_NAME {
-            // The canary proves the wiring works — it is never a finding.
-            canary_found = true;
+    let wrapped = canary::inject(probes, reader);
+    let lines = scanner.scan_stream_grouped(wrapped, &mut |text, hits, all_spans| {
+        if let Some(i) = canary::probe_index(text)
+            && let Some(p) = probes.get(i)
+            && canary::proves(p, hits)
+        {
+            proven[i] = true;
+        }
+        // The canary proves the wiring works — it is never a finding. Its
+        // spans stay in `all_spans` and are masked like every other.
+        let mut kept: Vec<(String, (usize, usize))> = Vec::new();
+        for (secret, span) in hits {
+            let base = variants::base_name(secret);
+            if base == canary::CANARY_NAME {
+                continue;
+            }
+            state
+                .matched_pairs
+                .insert((secret.to_string(), name.clone()));
+            state.matched_pairs.insert((base.to_string(), name.clone()));
+            if config.excepted(secret, &name) {
+                continue;
+            }
+            // The metric keys on the secret's own name: that is what the
+            // alert rule hands to `just rotor-leser`. The report names the
+            // spelling.
+            *state
+                .counts
+                .entry((base.to_string(), name.clone()))
+                .or_insert(0) += 1;
+            kept.push((secret.clone(), *span));
+        }
+        if kept.is_empty() {
             return;
         }
-        state
-            .matched_pairs
-            .insert((secret.to_string(), name.clone()));
-        if config.excepted(secret, &name) {
-            return;
+        // `locate` gets the REDACTED text: it must never echo line content,
+        // and a unit name pulled from a prefix that held a secret would.
+        let (source_field, location) = source.locate(&report::redact(text, all_spans));
+        for finding in Finding::from_hits(text, &kept, all_spans, &source_field, &location, now) {
+            state.out_lines.push(if state.with_context {
+                report::format(&finding)
+            } else {
+                report::format_brief(&finding)
+            });
+            state.findings += 1;
         }
-        *state
-            .counts
-            .entry((secret.to_string(), name.clone()))
-            .or_insert(0) += 1;
-        let (source_field, location) = source.locate(line);
-        let finding = Finding {
-            secret: secret.to_string(),
-            source: source_field,
-            location,
-            timestamp: now.to_string(),
-            line: line.to_string(),
-            span,
-        };
-        state.out_lines.push(report::format(&finding));
-        state.findings += 1;
     })?;
-    Ok((lines, canary_found))
+    let mut missing: Vec<&'static str> = Vec::new();
+    for (p, ok) in probes.iter().zip(&proven) {
+        let label = match p.kind {
+            Kind::Plain => "plain",
+            k => k.suffix(),
+        };
+        if !ok && !missing.contains(&label) {
+            missing.push(label);
+        }
+    }
+    Ok(SourceResult {
+        own_lines: lines.saturating_sub(probes.len() as u64),
+        missing,
+    })
 }
 
 struct Outcome {
@@ -290,6 +340,7 @@ struct Outcome {
     exit_code: u8,
     hits: Vec<(String, String, u64)>,
     canaries: Vec<(String, bool)>,
+    lines: Vec<(String, u64)>,
     now: u64,
 }
 
@@ -305,18 +356,18 @@ fn execute(
     sources: Vec<Box<dyn Source>>,
     all_secrets: Vec<(String, String)>,
     config: &Config,
+    with_context: bool,
 ) -> Result<Outcome> {
     let all_count = all_secrets.len();
     let multiline = secrets::multiline_note(&all_secrets);
 
     // The canary rides in the SAME scanner as the real secrets — a separate
     // scanner would prove nothing about the one actually used.
+    // Every canary value, in every spelling the scanner builds for it.
     let mut with_canary = all_secrets;
-    with_canary.push((
-        canary::CANARY_NAME.to_string(),
-        canary::CANARY_VALUE.to_string(),
-    ));
+    with_canary.extend(canary::secrets());
     let scanner = Scanner::new(with_canary)?;
+    let probes = canary::probes(&scanner);
 
     if !canary::check(&scanner) {
         anyhow::bail!(
@@ -332,8 +383,10 @@ fn execute(
         matched_pairs: HashSet::new(),
         counts: HashMap::new(),
         findings: 0,
+        with_context,
     };
     let mut canaries: Vec<(String, bool)> = Vec::new();
+    let mut line_counts: Vec<(String, u64)> = Vec::new();
     let mut tool_failure = false;
 
     for source in &sources {
@@ -350,25 +403,36 @@ fn execute(
         } else {
             format!("{name} ({wo})")
         };
-        match process_source(source.as_ref(), &scanner, config, &now_str, &mut state) {
-            Ok((lines_read, canary_found)) => {
+        match process_source(
+            source.as_ref(),
+            &scanner,
+            &probes,
+            config,
+            &now_str,
+            &mut state,
+        ) {
+            Ok(r) => {
+                let canary_found = r.missing.is_empty();
                 if !canary_found {
                     state.out_lines.push(format!(
-                        "ERROR: {woher}: canary not found — this run proves nothing"
+                        "ERROR: {woher}: canary not found (spellings: {}) — this run proves nothing",
+                        r.missing.join(", ")
                     ));
                     tool_failure = true;
-                } else if canary::source_was_silent(lines_read) {
+                } else if r.own_lines == 0 {
                     state.out_lines.push(format!(
                         "ERROR: {woher}: only the canary arrived — the source itself was silent"
                     ));
                     tool_failure = true;
                 }
-                canaries.push((name, canary_found));
+                canaries.push((name.clone(), canary_found));
+                line_counts.push((name, r.own_lines));
             }
             Err(e) => {
-                state.out_lines.push(format!("ERROR: {woher}: {e}"));
+                state.out_lines.push(format!("ERROR: {woher}: {e:#}"));
                 tool_failure = true;
-                canaries.push((name, false));
+                canaries.push((name.clone(), false));
+                line_counts.push((name, 0));
             }
         }
     }
@@ -387,6 +451,10 @@ fn execute(
     state
         .out_lines
         .push(secrets::skipped_short(all_count, scanner.pattern_count()));
+    state.out_lines.push(format!(
+        "{} encoded spellings and lines searched alongside (base64, url, json, hex, line)",
+        scanner.variant_count()
+    ));
     if let Some(note) = multiline {
         state.out_lines.push(note);
     }
@@ -415,6 +483,7 @@ fn execute(
         exit_code,
         hits,
         canaries,
+        lines: line_counts,
         now,
     })
 }
@@ -460,7 +529,7 @@ fn run_scan(a: &Args) -> Result<Outcome> {
         &a.machine,
     )?;
     let secrets = load_secrets(&a.secrets_repo, &a.secrets_root)?;
-    execute(sources, secrets, &config)
+    execute(sources, secrets, &config, true)
 }
 
 fn run_sensor(a: &Args) -> Result<(Outcome, PathBuf)> {
@@ -481,7 +550,9 @@ fn run_sensor(a: &Args) -> Result<(Outcome, PathBuf)> {
         &a.machine,
     )?;
     let secrets = load_secrets(&a.secrets_repo, &a.secrets_root)?;
-    let outcome = execute(sources, secrets, &config)?;
+    // No line context from the sensor: its stdout is the host journal, and
+    // from there Loki and every chat log that quotes it (audit 3, A2-1).
+    let outcome = execute(sources, secrets, &config, false)?;
     let output = a
         .output
         .clone()
@@ -499,7 +570,12 @@ fn run_command(a: &Args) -> Result<u8> {
         "sensor" => {
             let (outcome, output) = run_sensor(a)?;
             print!("{}", outcome.report);
-            let text = metrics::render(&outcome.hits, &outcome.canaries, outcome.now);
+            let text = metrics::render(
+                &outcome.hits,
+                &outcome.canaries,
+                &outcome.lines,
+                outcome.now,
+            );
             write_metrics_atomically(&output, &text)?;
             Ok(outcome.exit_code)
         }
@@ -577,5 +653,169 @@ mod tests {
         assert_eq!(sources.len(), 2);
         assert_eq!(sources[0].locate("line").1, "media-01");
         assert_eq!(sources[1].locate("line").1, "jelly-01");
+    }
+
+    // ------------------------------------------------ audit 3 (2026-09-27)
+
+    const A: &str = "Zq7Xw2mP9vK4tR8sL1nB";
+    const B: &str = "hH3jJ5kK7lL9zZ1xX3cC";
+
+    fn secrets_ab() -> Vec<(String, String)> {
+        vec![("probe-a".into(), A.into()), ("probe-b".into(), B.into())]
+    }
+
+    fn file_source(dir: &tempfile::TempDir, content: &str) -> Vec<Box<dyn Source>> {
+        let path = dir.path().join("x.log");
+        std::fs::write(&path, content).unwrap();
+        vec![Box::new(Files {
+            globs: vec![path.to_string_lossy().to_string()],
+        })]
+    }
+
+    #[test]
+    fn sensor_prints_no_line_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = file_source(
+            &dir,
+            &format!("distinct-context-word user={B} pass={A} retry={A}\nclean\n"),
+        );
+        let o = execute(src, secrets_ab(), &Config::default(), false).unwrap();
+        assert_eq!(o.exit_code, 1, "{}", o.report);
+        assert!(!o.report.contains(A) && !o.report.contains(B));
+        assert!(!o.report.contains("distinct-context-word"), "{}", o.report);
+        assert!(!o.report.contains(report::MASK), "{}", o.report);
+        assert!(o.report.contains("probe-a") && o.report.contains("probe-b"));
+    }
+
+    #[test]
+    fn scan_prints_context_with_every_secret_masked() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = file_source(&dir, &format!("ctx user={B} pass={A} retry={A}\nclean\n"));
+        let o = execute(src, secrets_ab(), &Config::default(), true).unwrap();
+        assert_eq!(o.exit_code, 1, "{}", o.report);
+        assert!(
+            !o.report.contains(A) && !o.report.contains(B),
+            "{}",
+            o.report
+        );
+        assert!(
+            o.report
+                .contains("ctx user=<REDACTED> pass=<REDACTED> retry=<REDACTED>")
+        );
+    }
+
+    #[test]
+    fn an_encoded_hit_is_named_by_spelling_and_counted_under_the_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let basic = variants::b64(format!("user:{A}").as_bytes(), variants::B64_STD);
+        let src = file_source(&dir, &format!("Authorization: Basic {basic}\nclean\n"));
+        let o = execute(src, secrets_ab(), &Config::default(), true).unwrap();
+        assert_eq!(o.exit_code, 1, "{}", o.report);
+        assert!(o.report.contains("probe-a[b64]"), "{}", o.report);
+        assert!(
+            o.report.contains("just rotor-leser probe-a\n")
+                || o.report.ends_with("just rotor-leser probe-a")
+        );
+        assert_eq!(
+            o.hits,
+            vec![("probe-a".to_string(), "files".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn an_exception_for_the_secret_covers_its_spellings() {
+        let dir = tempfile::tempdir().unwrap();
+        let hex = variants::hex(A.as_bytes(), false);
+        let src = file_source(&dir, &format!("dump {hex}\nclean\n"));
+        let config: Config = toml::from_str(
+            "[[exception]]\nsecret = \"probe-a\"\nsource = \"files\"\nreason = \"test\"\n",
+        )
+        .unwrap();
+        let o = execute(src, secrets_ab(), &config, true).unwrap();
+        assert_eq!(o.exit_code, 0, "{}", o.report);
+    }
+
+    #[test]
+    fn a_clean_source_proves_the_canary_in_every_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = file_source(&dir, "nothing\nhere\n");
+        let o = execute(src, secrets_ab(), &Config::default(), false).unwrap();
+        assert_eq!(o.exit_code, 0, "{}", o.report);
+        assert_eq!(o.canaries, vec![("files".to_string(), true)]);
+        assert_eq!(o.lines, vec![("files".to_string(), 2)]);
+    }
+
+    /// A Loki stand-in: the real paging reader over a fake fetcher.
+    struct FakeLoki {
+        entries: Vec<(u128, String)>,
+    }
+
+    impl Source for FakeLoki {
+        fn name(&self) -> &str {
+            "loki"
+        }
+        fn open(&self) -> Result<Box<dyn std::io::BufRead>> {
+            use leakwatch::sources::loki::LokiPages;
+            let entries = self.entries.clone();
+            let fetch = move |start: u128, end: u128, limit: usize| -> Result<Vec<u8>> {
+                let mut sel: Vec<&(u128, String)> = entries
+                    .iter()
+                    .filter(|(ts, _)| *ts >= start && *ts <= end)
+                    .collect();
+                sel.sort_by_key(|(ts, _)| *ts);
+                sel.truncate(limit);
+                let values: Vec<serde_json::Value> = sel
+                    .iter()
+                    .map(|(ts, l)| serde_json::json!([ts.to_string(), l]))
+                    .collect();
+                Ok(serde_json::to_vec(&serde_json::json!({
+                    "status": "success",
+                    "data": {"resultType": "streams",
+                             "result": [{"stream": {"job": "systemd-journal"}, "values": values}]}
+                }))?)
+            };
+            Ok(Box::new(std::io::BufReader::new(LokiPages::new(
+                fetch,
+                0,
+                u128::MAX,
+                leakwatch::sources::loki::PAGE_LIMIT,
+            ))))
+        }
+        fn locate(&self, _line: &str) -> (String, String) {
+            ("loki".into(), "fake".into())
+        }
+    }
+
+    #[test]
+    fn loki_scans_every_entry_of_a_window_larger_than_one_page() {
+        // 12 000 entries, the leak at 9 000 — far behind the first page.
+        let entries: Vec<(u128, String)> = (0..12_000u128)
+            .map(|i| {
+                let line = if i == 9_000 {
+                    format!("GET /api?apikey={A}")
+                } else {
+                    format!("line {i}")
+                };
+                (1_000 + i, line)
+            })
+            .collect();
+        let src: Vec<Box<dyn Source>> = vec![Box::new(FakeLoki { entries })];
+        let o = execute(src, secrets_ab(), &Config::default(), false).unwrap();
+        assert_eq!(o.exit_code, 1, "{}", o.report);
+        assert_eq!(o.hits, vec![("probe-a".to_string(), "loki".to_string(), 1)]);
+        assert_eq!(o.lines, vec![("loki".to_string(), 12_000)]);
+    }
+
+    #[test]
+    fn loki_that_cannot_be_paged_is_a_tool_failure() {
+        // More than one page of entries on a single timestamp.
+        let entries: Vec<(u128, String)> = (0..(leakwatch::sources::loki::PAGE_LIMIT + 1))
+            .map(|i| (7, format!("same ts {i}")))
+            .collect();
+        let src: Vec<Box<dyn Source>> = vec![Box::new(FakeLoki { entries })];
+        let o = execute(src, secrets_ab(), &Config::default(), false).unwrap();
+        assert_eq!(o.exit_code, 2, "{}", o.report);
+        assert!(o.report.contains("cannot be paged past"), "{}", o.report);
+        assert_eq!(o.canaries, vec![("loki".to_string(), false)]);
     }
 }

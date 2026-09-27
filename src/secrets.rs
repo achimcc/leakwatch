@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
+use zeroize::Zeroize;
 
 pub trait Secrets {
     fn load(&self) -> Result<Vec<(String, String)>>;
@@ -28,11 +29,16 @@ impl Secrets for RuntimeSecrets {
                 if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                     continue;
                 }
-                let Ok(value) = std::fs::read_to_string(entry.path()) else {
+                let Ok(mut value) = std::fs::read_to_string(entry.path()) else {
                     continue;
                 };
                 let name = entry.file_name().to_string_lossy().to_string();
-                out.push((name, value.strip_suffix('\n').unwrap_or(&value).to_string()));
+                // In place, not a trimmed copy: every copy is one more buffer
+                // that outlives its use. `Scanner::new` wipes this one.
+                if value.ends_with('\n') {
+                    value.pop();
+                }
+                out.push((name, value));
             }
         }
         if out.is_empty() {
@@ -54,7 +60,7 @@ impl Secrets for SopsSecrets {
     fn load(&self) -> Result<Vec<(String, String)>> {
         let mut out = Vec::new();
         for entry in walk_yaml(&self.repo.join("secrets"))? {
-            let output = std::process::Command::new("sops")
+            let mut output = std::process::Command::new("sops")
                 .arg("--decrypt")
                 .arg(&entry)
                 .output()
@@ -62,8 +68,9 @@ impl Secrets for SopsSecrets {
             if !output.status.success() {
                 bail!("sops --decrypt failed for {entry:?}");
             }
-            let text = String::from_utf8_lossy(&output.stdout);
-            out.extend(parse_sops_yaml(&text)?);
+            let parsed = parse_sops_yaml(&String::from_utf8_lossy(&output.stdout));
+            output.stdout.zeroize();
+            out.extend(parsed?);
         }
         if out.is_empty() {
             bail!("no secrets decrypted from {:?}", self.repo);
@@ -158,14 +165,18 @@ pub fn skipped_short(all: usize, used: usize) -> String {
     )
 }
 
-/// How many loaded values span more than one line. Such a value is only found
-/// if it appears in the data in full — a real limit, and one a run has to
-/// state rather than leave silent. Taking each line as its own pattern is not
-/// the answer: `-----BEGIN PRIVATE KEY-----` would then match every PEM.
+/// How many loaded values span more than one line. Such a value cannot
+/// match a single scanned line as it is; it is found JSON-escaped (one log
+/// line) and through those of its lines that look like key material (see
+/// `variants::lines`) — a real limit, and one a run has to state rather than
+/// leave silent. Taking every line as its own pattern is not the answer:
+/// `-----BEGIN PRIVATE KEY-----` would then match every PEM.
 pub fn multiline_note(values: &[(String, String)]) -> Option<String> {
     let n = values.iter().filter(|(_, v)| v.contains('\n')).count();
     (n > 0).then(|| {
-        format!("{n} patterns span multiple lines and are found only if they appear in full")
+        format!(
+            "{n} patterns span multiple lines and are found only JSON-escaped or by their key-shaped lines"
+        )
     })
 }
 

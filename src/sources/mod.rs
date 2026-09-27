@@ -204,7 +204,7 @@ mod tests {
             via_ssh: None,
             since: "7d".into(),
         };
-        let cmd = l.command();
+        let cmd = l.command(0, 1, 5000);
         assert_eq!(cmd[0], "curl");
         assert!(cmd.iter().any(|a| a.contains("query_range")));
         assert!(
@@ -225,7 +225,7 @@ mod tests {
             via_ssh: Some("root@host.example.com".into()),
             since: "7d".into(),
         };
-        let cmd = l.command();
+        let cmd = l.command(0, 1, 5000);
         assert_eq!(cmd[0], "ssh");
         assert!(cmd.contains(&"root@host.example.com".to_string()));
         assert!(

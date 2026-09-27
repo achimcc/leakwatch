@@ -43,10 +43,16 @@ pub struct Exception {
 }
 
 impl Config {
+    /// Is this hit excepted? `secret` is a pattern name; an exception for
+    /// the secret's own name covers every spelling of it (`foo` covers
+    /// `foo[url]`), an exception for `foo[url]` only that spelling. The same
+    /// identifier in the same place does not become a new finding because a
+    /// proxy percent-encoded it.
     pub fn excepted(&self, secret: &str, source: &str) -> bool {
+        let base = crate::variants::base_name(secret);
         self.exceptions
             .iter()
-            .any(|e| e.secret == secret && e.source == source)
+            .any(|e| (e.secret == secret || e.secret == base) && e.source == source)
     }
 
     /// Exceptions that matched nothing in this run.
@@ -74,7 +80,7 @@ impl Config {
         if let Some(e) = self
             .exceptions
             .iter()
-            .find(|e| e.secret == crate::canary::CANARY_NAME)
+            .find(|e| crate::variants::base_name(&e.secret) == crate::canary::CANARY_NAME)
         {
             anyhow::bail!(
                 "exception for {} ({}): canary hits are filtered before they become findings, \

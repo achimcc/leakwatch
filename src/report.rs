@@ -6,9 +6,13 @@
 //! called `trackers` and held an announce URL; nobody was looking for a
 //! secret in it.
 //!
-//! Overlapping spans are merged before redacting to prevent the tail of a secret from
-//! surviving when a shorter mask replaces a longer secret. Debug is hand-written to
-//! redact the line field and prevent accidental leaks from `{:?}` or `dbg!` calls.
+//! EVERY span of a line is masked ONCE, before any finding is built — the
+//! reported hit, a second occurrence, a neighbouring secret, an excepted one,
+//! the canary. v0.1.1 masked only the finding's own span, and the sensor
+//! wrote the neighbours into the host journal (audit 3, A2-1). Overlapping
+//! spans are merged so the tail of a longer secret cannot survive a shorter
+//! mask. The sensor prints no line at all ([`format_brief`]); control
+//! characters never reach the output ([`sanitize`]).
 
 /// What replaces a secret in any output.
 pub const MASK: &str = "<REDACTED>";
@@ -16,15 +20,26 @@ pub const MASK: &str = "<REDACTED>";
 /// How much context is kept on either side of a hit.
 const CONTEXT: usize = 120;
 
+/// One finding, built only by [`Finding::from_hits`].
+///
+/// THE LINE IS STORED ALREADY REDACTED — every span of every pattern in it,
+/// not only this finding's. In v0.1.1 a finding carried the raw line and
+/// only its own span, and `format` masked that one span: the second
+/// occurrence of the same value, or a password next to its user name, came
+/// out in plaintext (audit 3, A2-1). A `Finding` can no longer hold a raw
+/// line: the fields that could are private, and the only constructor masks
+/// first.
 #[derive(Clone)]
 pub struct Finding {
-    /// The sops key name — never the value.
+    /// The pattern name — `secret` or `secret[kind]` — never the value.
     pub secret: String,
     pub source: String,
     pub location: String,
     pub timestamp: String,
-    pub line: String,
-    pub span: (usize, usize),
+    /// The text with EVERY hit replaced by [`MASK`].
+    line: String,
+    /// Where this finding's mask stands in `line`.
+    mask: (usize, usize),
 }
 
 impl std::fmt::Debug for Finding {
@@ -34,23 +49,59 @@ impl std::fmt::Debug for Finding {
             .field("source", &self.source)
             .field("location", &self.location)
             .field("timestamp", &self.timestamp)
-            .field("line", &redact(&self.line, &[self.span]))
-            .field("span", &self.span)
+            .field("line", &sanitize(&self.line))
+            .field("mask", &self.mask)
             .finish()
     }
 }
 
-/// Replace every span with [`MASK`].
-///
-/// Overlapping spans are merged before replacement. The merged spans are applied
-/// back to front so earlier offsets stay valid.
-pub fn redact(line: &str, spans: &[(usize, usize)]) -> String {
-    let mut out = line.to_string();
-    let mut spans = spans.to_vec();
+impl Finding {
+    /// Findings for the `hits` in `text`. `all_spans` are the spans of every
+    /// pattern found in `text` — the reported hits, excepted ones, the
+    /// canary — and all of them are masked before anything is kept. The
+    /// hits' own spans are masked too, whether or not the caller passed them
+    /// in `all_spans`.
+    pub fn from_hits(
+        text: &str,
+        hits: &[(String, (usize, usize))],
+        all_spans: &[(usize, usize)],
+        source: &str,
+        location: &str,
+        timestamp: &str,
+    ) -> Vec<Finding> {
+        let mut spans = all_spans.to_vec();
+        spans.extend(hits.iter().map(|(_, s)| *s));
+        let (line, map) = redact_mapped(text, &spans);
+        hits.iter()
+            .map(|(secret, (start, _))| {
+                let mask = map
+                    .iter()
+                    .find(|((os, oe), _)| os <= start && start < oe)
+                    .map(|(_, n)| *n)
+                    .unwrap_or((0, 0));
+                Finding {
+                    secret: secret.clone(),
+                    source: source.to_string(),
+                    location: location.to_string(),
+                    timestamp: timestamp.to_string(),
+                    line: line.clone(),
+                    mask,
+                }
+            })
+            .collect()
+    }
 
-    // Merge overlapping and touching spans.
+    /// The redacted line.
+    pub fn line(&self) -> &str {
+        &self.line
+    }
+}
+
+/// Merge overlapping and touching spans, sorted by start.
+fn merge(spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut spans = spans.to_vec();
     spans.sort_unstable_by_key(|(start, _)| *start);
-    let mut merged = Vec::new();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
     for (start, end) in spans {
         if let Some((_, last_end)) = merged.last_mut()
             && start <= *last_end
@@ -61,45 +112,102 @@ pub fn redact(line: &str, spans: &[(usize, usize)]) -> String {
         }
         merged.push((start, end));
     }
-
-    // Apply replacements back to front.
-    merged.sort_unstable_by_key(|(start, _)| std::cmp::Reverse(*start));
-    for (start, end) in merged {
-        out.replace_range(start..end, MASK);
-    }
-    out
+    merged
 }
 
-/// Render a finding. The value cannot appear: the line is redacted before it
-/// is ever trimmed or printed.
+/// A merged span in the original text and the span of its mask in the output.
+type Moved = ((usize, usize), (usize, usize));
+
+/// Replace every span with [`MASK`] and say where each merged span went.
+fn redact_mapped(line: &str, spans: &[(usize, usize)]) -> (String, Vec<Moved>) {
+    let mut out = String::with_capacity(line.len());
+    let mut map = Vec::new();
+    let mut cursor = 0;
+    for (start, end) in merge(spans) {
+        let start = start.min(line.len()).max(cursor);
+        let end = end.min(line.len());
+        out.push_str(&line[cursor..start]);
+        let at = out.len();
+        out.push_str(MASK);
+        map.push(((start, end), (at, out.len())));
+        cursor = end.max(start);
+    }
+    out.push_str(&line[cursor..]);
+    (out, map)
+}
+
+/// Replace every span with [`MASK`].
+///
+/// Overlapping spans are merged before replacement, so the tail of a longer
+/// secret cannot survive a shorter one's mask.
+pub fn redact(line: &str, spans: &[(usize, usize)]) -> String {
+    redact_mapped(line, spans).0
+}
+
+/// Control characters out of text meant for a terminal, a journal or a mail:
+/// an escape sequence in a log line (OSC 52 writes the clipboard, `ESC[2J`
+/// clears the screen) must not reach whoever reads the report. Tab stays.
+pub fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() && c != '\t' {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Render a finding with context — for `scan`, read by a person. The value
+/// cannot appear: the line was redacted when the finding was built, before
+/// it is ever trimmed or printed.
 pub fn format(f: &Finding) -> String {
-    let redacted = redact(&f.line, &[f.span]);
-    // Trim AFTER redacting — trimming first could cut the span and let the
-    // tail of a secret survive.
-    let hit = redacted.find(MASK).unwrap_or(0);
-    let from = hit.saturating_sub(CONTEXT);
-    let to = (hit + MASK.len() + CONTEXT).min(redacted.len());
-    let from = floor_char_boundary(&redacted, from);
-    let to = floor_char_boundary(&redacted, to);
+    let redacted = &f.line;
+    let (hit, hit_end) = f.mask;
+    let from = floor_char_boundary(redacted, hit.saturating_sub(CONTEXT));
+    let to = floor_char_boundary(redacted, (hit_end + CONTEXT).min(redacted.len()));
     let mut context = String::new();
     if from > 0 {
         context.push('…');
     }
-    context.push_str(&redacted[from..to]);
+    context.push_str(&sanitize(&redacted[from..to]));
     if to < redacted.len() {
         context.push('…');
     }
     format!(
         "{}  {}  {}  {}\n  {}\n  → just rotor-leser {}",
-        f.secret, f.source, f.location, f.timestamp, context, f.secret
+        sanitize(&f.secret),
+        f.source,
+        sanitize(&f.location),
+        f.timestamp,
+        context,
+        crate::variants::base_name(&f.secret)
+    )
+}
+
+/// Render a finding WITHOUT any line content — for `sensor`, whose stdout
+/// lands in the host journal and from there in Loki and every chat log that
+/// quotes it. A redacted line is still a copy of someone else's log line,
+/// and the redaction is the one thing that must never fail there. Name,
+/// source, location and time are enough to start the triage on the machine.
+pub fn format_brief(f: &Finding) -> String {
+    format!(
+        "{}  {}  {}  {}\n  → just rotor-leser {}",
+        sanitize(&f.secret),
+        f.source,
+        sanitize(&f.location),
+        f.timestamp,
+        crate::variants::base_name(&f.secret)
     )
 }
 
 fn floor_char_boundary(s: &str, mut i: usize) -> usize {
-    while i < s.len() && !s.is_char_boundary(i) {
+    i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
         i -= 1;
     }
-    i.min(s.len())
+    i
 }
 
 #[cfg(test)]
@@ -109,14 +217,15 @@ mod tests {
     const CANARY: &str = "sk-canary-9f3b2a7e4d1c";
 
     fn finding(line: &str, span: (usize, usize)) -> Finding {
-        Finding {
-            secret: "test-secret".into(),
-            source: "journal".into(),
-            location: "server/media-01 radarr.service".into(),
-            timestamp: "2026-09-18 14:03:22".into(),
-            line: line.into(),
-            span,
-        }
+        Finding::from_hits(
+            line,
+            &[("test-secret".to_string(), span)],
+            &[],
+            "journal",
+            "server/media-01 radarr.service",
+            "2026-09-18 14:03:22",
+        )
+        .remove(0)
     }
 
     #[test]

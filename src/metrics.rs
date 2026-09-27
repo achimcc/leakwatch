@@ -13,7 +13,12 @@ fn escape_label(v: &str) -> String {
         .replace('\n', "\\n")
 }
 
-pub fn render(hits: &[(String, String, u64)], canaries: &[(String, bool)], now: u64) -> String {
+pub fn render(
+    hits: &[(String, String, u64)],
+    canaries: &[(String, bool)],
+    lines: &[(String, u64)],
+    now: u64,
+) -> String {
     let mut out = String::new();
     out.push_str("# HELP leakwatch_finding secrets in places they should not be\n");
     out.push_str("# TYPE leakwatch_finding gauge\n");
@@ -62,6 +67,28 @@ pub fn render(hits: &[(String, String, u64)], canaries: &[(String, bool)], now: 
             u8::from(*ok)
         ));
     }
+    // HOW MUCH WAS READ, summed per source name. A canary proves a source
+    // delivered SOMETHING; a line count proves how much — up to v0.1.1 the
+    // Loki adapter saw 5 000 of ~97 700 entries per window and the canary
+    // still came back (audit 3, A2-2). Compared against Loki's own
+    // `count_over_time`, a shortfall is visible.
+    out.push_str(
+        "# HELP leakwatch_lines_scanned lines a source delivered in this run, probes excluded\n",
+    );
+    out.push_str("# TYPE leakwatch_lines_scanned gauge\n");
+    let mut summed: Vec<(String, u64)> = Vec::new();
+    for (source, n) in lines {
+        match summed.iter_mut().find(|(s, _)| s == source) {
+            Some((_, total)) => *total += n,
+            None => summed.push((source.clone(), *n)),
+        }
+    }
+    for (source, n) in &summed {
+        let source = escape_label(source);
+        out.push_str(&format!(
+            "leakwatch_lines_scanned{{source=\"{source}\"}} {n}\n"
+        ));
+    }
     out.push_str(&format!("leakwatch_run_timestamp {now}\n"));
     out
 }
@@ -75,6 +102,7 @@ mod tests {
         let text = render(
             &[("radarr-apikey".into(), "journal".into(), 3)],
             &[("journal".into(), true)],
+            &[],
             1758300000,
         );
         assert!(text.contains("leakwatch_finding"));
@@ -84,7 +112,7 @@ mod tests {
 
     #[test]
     fn a_failed_canary_is_zero_not_absent() {
-        let text = render(&[], &[("loki".into(), false)], 1758300000);
+        let text = render(&[], &[("loki".into(), false)], &[], 1758300000);
         assert!(text.contains("leakwatch_canary_found{source=\"loki\"} 0"));
     }
 
@@ -95,7 +123,7 @@ mod tests {
             .map(|_| ("journal".to_string(), true))
             .chain(std::iter::once(("loki".to_string(), true)))
             .collect();
-        let text = render(&[], &canaries, 1758300000);
+        let text = render(&[], &canaries, &[], 1758300000);
         let journal_lines = text
             .lines()
             .filter(|l| l.starts_with("leakwatch_canary_found{source=\"journal\"}"))
@@ -114,7 +142,7 @@ mod tests {
         let mut canaries: Vec<(String, bool)> =
             (0..32).map(|_| ("journal".to_string(), true)).collect();
         canaries.push(("journal".to_string(), false));
-        let text = render(&[], &canaries, 1758300000);
+        let text = render(&[], &canaries, &[], 1758300000);
         assert!(
             text.contains("leakwatch_canary_found{source=\"journal\"} 0"),
             "folding must be AND, not first-wins or max:\n{text}"
@@ -126,7 +154,7 @@ mod tests {
         // Same set, failure first instead of last.
         let mut canaries: Vec<(String, bool)> = vec![("journal".to_string(), false)];
         canaries.extend((0..32).map(|_| ("journal".to_string(), true)));
-        let text = render(&[], &canaries, 1758300000);
+        let text = render(&[], &canaries, &[], 1758300000);
         assert!(
             text.contains("leakwatch_canary_found{source=\"journal\"} 0"),
             "a failure seen first must survive the healthy ones after it:\n{text}"
@@ -134,9 +162,31 @@ mod tests {
     }
 
     #[test]
+    fn lines_scanned_are_summed_per_source_name() {
+        let text = render(
+            &[],
+            &[],
+            &[
+                ("journal".into(), 10),
+                ("journal".into(), 5),
+                ("loki".into(), 7),
+            ],
+            1758300000,
+        );
+        assert!(
+            text.contains("leakwatch_lines_scanned{source=\"journal\"} 15"),
+            "{text}"
+        );
+        assert!(
+            text.contains("leakwatch_lines_scanned{source=\"loki\"} 7"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn a_label_value_with_quotes_backslashes_and_a_newline_stays_one_line() {
         let nasty = "weird\"name\\with\nnewline".to_string();
-        let text = render(&[(nasty, "journal".into(), 1)], &[], 1758300000);
+        let text = render(&[(nasty, "journal".into(), 1)], &[], &[], 1758300000);
         let finding_line = text
             .lines()
             .find(|l| l.starts_with("leakwatch_finding{"))

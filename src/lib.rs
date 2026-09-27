@@ -5,3 +5,4 @@ pub mod report;
 pub mod scan;
 pub mod secrets;
 pub mod sources;
+pub mod variants;

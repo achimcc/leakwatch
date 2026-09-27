@@ -13,6 +13,16 @@ does not guess: it is handed the actual secret values — the same plaintext
 every service already reads from `/run/secrets` — and searches for exactly
 those bytes with Aho-Corasick. No boundaries to get right, no shape to miss.
 
+And not only those bytes: logs rarely carry a secret verbatim. Each value is
+also searched in the spellings it takes on its way into a log — Base64
+(standard and URL-safe, in all three byte alignments, so `Authorization:
+Basic base64(user:password)` is found), percent-encoding (several common
+safe sets, upper- and lowercase, `+` for a space), JSON escapes (standard,
+`\/`, Go's `\u0026`, ASCII-only) and hex (lower- and uppercase). A value
+that spans several lines is additionally searched line by line, for the
+lines shaped like key material. A report names the spelling that leaked:
+`radarr-apikey[b64]`.
+
 ## Why no HMAC
 
 An index of hashed tokens would need the same boundary guess a masking
@@ -25,8 +35,11 @@ guessing the tool exists to avoid.
 
 ## What it finds and does not
 
-Every run injects one canary value into every source before scanning and
-checks, per adapter, that the canary came back. Without this, "0 findings"
+Every run injects a canary into every source before scanning — in every
+spelling it searches for, each probe a real embedding (`base64("u:" +
+canary + "!")`, the canary percent-encoded in a query string, JSON-escaped
+in an object, …) — and checks, per adapter, that every probe came back as a
+hit of its own spelling. Without this, "0 findings"
 and "the scanner never got to look" print identically — which is exactly
 how a broken command, a dead ssh path or a stale glob turns into silence.
 The canary is never reported as a finding itself; it only proves the
@@ -42,7 +55,17 @@ test-secret  files  /var/log/caddy/access.log  1758300012
 ```
 
 A finding never prints the value — only the secret's name, where it was
-found, and a redacted line with context trimmed around the hit. The last
+found, and a redacted line with context trimmed around the hit. Every
+secret in that line is masked, not just the one reported: a second
+occurrence of the same value, the password next to its user name, an
+excepted identifier. Control characters in the line are replaced, so an
+escape sequence in a log cannot reach the terminal that reads the report.
+
+`sensor` prints no line content at all — only name, source, location and
+time. Its stdout ends up in the host journal, and from there in a log store
+and in every chat log that quotes it; a redacted copy of someone else's log
+line has no business there. The context is one `leakwatch scan` away on the
+machine. The last
 line of every finding names the rotation command
 (`just rotor-leser <secret>`), because a leak's real fix is a rotation, not
 a suppressed alert.
@@ -52,7 +75,7 @@ a suppressed alert.
 | Source | What | Reads |
 |---|---|---|
 | `journal` | the host's own journal, or one or more guests' via `journalctl -M` (`--machine`, repeatable) | locally, streamed, or over `ssh` |
-| `loki` | the aggregated log store, which also proves whether a log-scrubbing regex mask elsewhere actually holds | `curl`, optionally wrapped in `ssh` — Loki commonly listens on an address the machine running leakwatch cannot reach directly |
+| `loki` | the aggregated log store, which also proves whether a log-scrubbing regex mask elsewhere actually holds | `curl`, optionally wrapped in `ssh` — Loki commonly listens on an address the machine running leakwatch cannot reach directly. The window is paged oldest-first (5000 entries per request) and every log line is scanned as its own line; a full page that cannot be paged past (all entries on one timestamp) is a tool failure, not a truncated clean result |
 | `sessions` | Claude session transcripts, where the household's real chat leaks actually landed | streamed, files opened lazily (972 files would cost 972 descriptors at once) |
 | `files` | log files that never pass through Loki, e.g. Caddy's access log | glob patterns, `--files`, repeatable; not selected by default because a guessed default path is not a finding |
 
@@ -99,7 +122,16 @@ never reads a half-written file. `leakwatch_finding{secret,source}` never
 carries a value, only a secret's name and its source; `leakwatch_canary_found{source}`
 is `0`, not absent, when the canary did not come back for a source — an
 absent series and a healthy one look the same to an alerting rule, a zero
-does not. `leakwatch_run_timestamp` names when the run happened.
+does not. `leakwatch_lines_scanned{source}` counts the lines each source
+delivered (summed per source name, probes excluded) — the canary proves a
+source delivered something, the count says how much, and comparing it with
+the log store's own count shows a shortfall. `leakwatch_run_timestamp`
+names when the run happened.
+
+A finding in an encoded spelling counts under the secret's own name in
+`leakwatch_finding` — that is the name a rotation needs; the report text
+names the spelling. Likewise an exception for `foo` covers every spelling
+of `foo`; one for `foo[url]` covers only that spelling.
 
 ### Exit status
 
@@ -162,12 +194,17 @@ as a stale exception instead — a message pointing at the wrong cause.
 ## Limits
 
 - A value shorter than 8 bytes is never searched for — it would match
-  constantly and drown every real finding. A run states how many of the
-  loaded secrets were skipped this way.
-- A secret that spans more than one line is only found if it appears in
-  the data whole. Splitting it into single-line patterns is not the fix:
-  `-----BEGIN PRIVATE KEY-----` would then match every PEM file. A run
-  states how many of the loaded values are multiline.
+  constantly and drown every real finding — and neither is any spelling of
+  it; every encoded spelling must itself be at least 8 bytes long. A run
+  states how many of the loaded secrets were skipped this way.
+- A secret that spans more than one line is found whole in its JSON-escaped
+  form (one log line) and otherwise line by line — but only for lines of at
+  least 16 characters that look like key material: Base64/token characters
+  only, letters and digits mixed. Taking every line would make
+  `-----BEGIN PRIVATE KEY-----` match every PEM file and `LOG_LEVEL=info`
+  half the rendered templates. A run states how many values are multiline.
+- Spellings not searched: UTF-16, case-changed copies, double encodings,
+  Base64 wrapped at 76 columns, and anything compressed or encrypted.
 - `sessions` and `files` read the local filesystem only; `journal` reads
   the local host or one or more named guests via `journalctl -M`
   (`--machine`); `journal` and `loki` can both be reached over `ssh`.
@@ -186,6 +223,30 @@ as a stale exception instead — a message pointing at the wrong cause.
   line's own timestamp is in the report text; for the other adapters there is
   no per-finding time. "Is this one of the leaks from last Tuesday?" is not a
   question a report answers.
+
+## Running it as a unit
+
+The process holds every secret of the machine in memory. On the code side,
+releases are built with `panic = "abort"`, and the buffers the values are
+read into (files under the secrets roots, `sops` output, the pattern list)
+are wiped with `zeroize` once the automaton is built. What cannot be wiped:
+the automaton's own copy of every pattern, which lives as long as the run,
+and the YAML tree `serde_norway` builds from `sops` output. The rest belongs
+in the unit:
+
+```ini
+LimitCORE=0            # no core dump carrying every secret to disk
+MemorySwapMax=0        # no page of it in swap
+IPAddressDeny=any
+IPAddressAllow=192.0.2.12/32   # only where Loki listens; nothing without Loki
+                               # (or PrivateNetwork=true)
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+ProtectSystem=strict
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH   # only for journalctl -M into guests
+```
 
 ## Install
 

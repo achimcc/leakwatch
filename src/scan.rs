@@ -5,46 +5,87 @@
 //! secret starts and ends, and that guess is what the five chat leaks and the
 //! two mask gaps were made of. Aho-Corasick needs no boundaries.
 
+use crate::variants::{self, Kind};
 use aho_corasick::AhoCorasick;
 use anyhow::{Context, Result};
 use std::io::BufRead;
+use zeroize::Zeroize;
+
+pub use crate::variants::MIN_LEN;
+
+/// One hit: the pattern name (`secret` or `secret[kind]`) and its byte span.
+pub type Hit = (String, (usize, usize));
 
 pub struct Scanner {
     ac: AhoCorasick,
     names: Vec<String>,
     longest: usize,
+    searched: usize,
 }
-
-/// Values shorter than this are not searched for: they would match constantly
-/// and drown every real finding. The audit reports how many were skipped.
-const MIN_LEN: usize = 8;
 
 impl Scanner {
     pub fn new(secrets: Vec<(String, String)>) -> Result<Scanner> {
-        // Trim once: use the trimmed value for both the length check and the
-        // pattern. A secret read from a file normally carries a trailing
-        // newline; that newline must not go into the pattern, or it can never
-        // match anything — BufRead::lines() strips line terminators from every
-        // scanned line. Spaces INSIDE the value are preserved.
-        let usable: Vec<(String, String)> = secrets
-            .into_iter()
-            .map(|(n, v)| (n, v.trim().to_string()))
-            .filter(|(_, v)| v.len() >= MIN_LEN)
-            .collect();
-        let names: Vec<String> = usable.iter().map(|(n, _)| n.clone()).collect();
-        let values: Vec<String> = usable.into_iter().map(|(_, v)| v).collect();
+        let mut names: Vec<String> = Vec::new();
+        let mut values: Vec<String> = Vec::new();
+        let mut searched = 0usize;
+        for (name, mut raw) in secrets {
+            // Trim once: use the trimmed value for both the length check and
+            // the pattern. A secret read from a file normally carries a
+            // trailing newline; that newline must not go into the pattern, or
+            // it can never match anything — BufRead::lines() strips line
+            // terminators from every scanned line. Spaces INSIDE the value are
+            // preserved.
+            let v = raw.trim().to_string();
+            raw.zeroize();
+            // Values shorter than MIN_LEN are not searched for — in no
+            // spelling: they would match constantly and drown every real
+            // finding. The run reports how many were skipped.
+            if v.len() < MIN_LEN {
+                let mut v = v;
+                v.zeroize();
+                continue;
+            }
+            searched += 1;
+            let first = values.len();
+            for (kind, s) in variants::spellings(&v) {
+                names.push(kind.name(&name));
+                values.push(s);
+            }
+            for l in variants::lines(&v) {
+                if values[first..].contains(&l) {
+                    continue;
+                }
+                names.push(Kind::Line.name(&name));
+                values.push(l);
+            }
+            names.push(name);
+            values.push(v);
+        }
         let longest = values.iter().map(|v| v.len()).max().unwrap_or(0);
-        let ac = AhoCorasick::new(&values).context("building the automaton")?;
-        Ok(Scanner { ac, names, longest })
+        let ac = AhoCorasick::new(&values).context("building the automaton");
+        // The automaton holds its own copy; ours need not outlive it. (The
+        // copy inside the automaton cannot be wiped — see README, "Memory".)
+        for v in &mut values {
+            v.zeroize();
+        }
+        Ok(Scanner {
+            ac: ac?,
+            names,
+            longest,
+            searched,
+        })
     }
 
     pub fn longest(&self) -> usize {
         self.longest
     }
 
-    pub fn scan_line(&self, line: &str) -> Vec<(String, (usize, usize))> {
+    /// Every hit in `line`, OVERLAPPING ones included. A secret that contains
+    /// another (a rendered URL holding a password) must yield both spans, or
+    /// redaction masks only the inner one.
+    pub fn scan_line(&self, line: &str) -> Vec<Hit> {
         self.ac
-            .find_iter(line)
+            .find_overlapping_iter(line)
             .map(|m| {
                 (
                     self.names[m.pattern().as_usize()].clone(),
@@ -55,7 +96,8 @@ impl Scanner {
     }
 
     /// Scan a stream line by line, carrying the tail of the previous line so a
-    /// value broken across a line boundary is still found.
+    /// value broken across a line boundary is still found. One callback per
+    /// hit — see [`Scanner::scan_stream_grouped`] for the form a report needs.
     ///
     /// Returns the number of lines read — a caller that gets 0 read nothing,
     /// which is a tool error, not a clean result.
@@ -64,6 +106,30 @@ impl Scanner {
         &self,
         r: R,
         on_hit: &mut dyn FnMut(&str, &str, (usize, usize)),
+    ) -> Result<u64> {
+        self.scan_stream_grouped(r, &mut |text, hits, _all| {
+            for (name, span) in hits {
+                on_hit(name, text, *span);
+            }
+        })
+    }
+
+    /// Like [`Scanner::scan_stream`], but one callback per TEXT: the text, the
+    /// hits to report in it, and EVERY span of every pattern in it.
+    ///
+    /// WHY THE THIRD ARGUMENT: a report shows context around a hit, and that
+    /// context must have every other secret in the same text masked too —
+    /// the second occurrence of the same value, the password next to the
+    /// user name, an excepted identifier, the canary. Masking only the
+    /// reported hit is how v0.1.1 printed the neighbours in plaintext into
+    /// the host journal (audit 3, A2-1).
+    ///
+    /// The callback runs only for texts with at least one hit to report.
+    #[allow(clippy::type_complexity)]
+    pub fn scan_stream_grouped<R: BufRead>(
+        &self,
+        r: R,
+        on_text: &mut dyn FnMut(&str, &[Hit], &[(usize, usize)]),
     ) -> Result<u64> {
         let mut carry = String::new();
         let mut lines = 0u64;
@@ -84,15 +150,22 @@ impl Scanner {
             // that text was the current line. Otherwise every hit near a line
             // end is counted twice.
             if seam > 0 {
-                for (name, (start, end)) in self.scan_line(&joined) {
-                    if start < seam && end > seam {
-                        on_hit(&name, &joined, (start, end));
-                    }
+                let all = self.scan_line(&joined);
+                let crossing: Vec<Hit> = all
+                    .iter()
+                    .filter(|(_, (start, end))| *start < seam && *end > seam)
+                    .cloned()
+                    .collect();
+                if !crossing.is_empty() {
+                    let spans: Vec<(usize, usize)> = all.iter().map(|(_, s)| *s).collect();
+                    on_text(&joined, &crossing, &spans);
                 }
             }
 
-            for (name, span) in self.scan_line(&line) {
-                on_hit(&name, &line, span);
+            let hits = self.scan_line(&line);
+            if !hits.is_empty() {
+                let spans: Vec<(usize, usize)> = hits.iter().map(|(_, s)| *s).collect();
+                on_text(&line, &hits, &spans);
             }
 
             // Carry the tail of the JOINED text, not of this line alone —
@@ -104,11 +177,32 @@ impl Scanner {
         Ok(lines)
     }
 
-    /// How many values the automaton actually searches for — `Scanner::new`
+    /// How many SECRETS the automaton actually searches for — `Scanner::new`
     /// drops everything shorter than `MIN_LEN`, and a run has to be able to
-    /// say so.
+    /// say so. Encoded variants are not counted here, see
+    /// [`Scanner::variant_count`].
     pub fn pattern_count(&self) -> usize {
-        self.names.len()
+        self.searched
+    }
+
+    /// How many patterns beyond the plain values: encoded spellings and
+    /// single lines of multi-line values.
+    pub fn variant_count(&self) -> usize {
+        self.names.len() - self.searched
+    }
+
+    /// Which kinds of spelling the automaton carries for `secret`.
+    pub fn kinds_of(&self, secret: &str) -> Vec<Kind> {
+        let mut out: Vec<Kind> = Vec::new();
+        for n in &self.names {
+            if variants::base_name(n) == secret {
+                let k = Kind::of(n);
+                if !out.contains(&k) {
+                    out.push(k);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -180,8 +274,10 @@ mod tests {
     }
 
     #[test]
-    fn longest_is_the_longest_secret() {
-        assert_eq!(scanner().longest(), "abc123def456ghi789".len());
+    fn longest_is_the_longest_pattern() {
+        // The hex spelling doubles the value and is the longest pattern; the
+        // carry must cover it or a hex dump broken across lines is lost.
+        assert_eq!(scanner().longest(), 2 * "abc123def456ghi789".len());
     }
 
     #[test]
