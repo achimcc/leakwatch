@@ -24,6 +24,10 @@ zeroize = "1"
 proptest = "1"
 tempfile = "3"
 
+[lints.rust]
+# No `unsafe` anywhere in this crate, and no `#[allow]` can bring it back.
+unsafe_code = "forbid"
+
 [profile.release]
 lto = true
 # A panic must not unwind through frames that hold secret values, and a
