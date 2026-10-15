@@ -166,6 +166,7 @@ mod tests {
                 "journalctl",
                 "--output=short-iso",
                 "--no-pager",
+                "--all",
                 "--since",
                 "-7d"
             ]
@@ -249,6 +250,7 @@ mod tests {
                 "journalctl",
                 "--output=short-iso",
                 "--no-pager",
+                "--all",
                 "--since",
                 "-7d"
             ]

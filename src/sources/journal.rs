@@ -38,6 +38,14 @@ impl Journal {
         // is harmless: it holds a date, a host name and a unit name.
         c.push("--output=short-iso".into());
         c.push("--no-pager".into());
+        // `--all`, OR THE VALUE IS NEVER SEEN. Without it `journalctl` replaces
+        // any message that holds a control character (`\r`, BEL, invalid
+        // UTF-8) with the literal `[N blob data]` — the secret is in the
+        // journal, the scanner reads a placeholder, the canary stays green.
+        // Measured on 2026-10-15 (systemd 261.3): `short-iso` printed
+        // `[28B blob data]`, `--all` printed the value. A service that logs a
+        // request line with a stray `\r` is exactly the kind that leaks.
+        c.push("--all".into());
         c.push("--since".into());
         c.push(format!("-{}", self.since));
 
@@ -163,5 +171,16 @@ mod tests {
             "without the prefix `locate` can never name a unit: {cmd:?}"
         );
         assert!(!cmd.contains(&"--output=cat".to_string()));
+    }
+
+    #[test]
+    fn the_command_asks_for_all_so_a_control_character_cannot_hide_the_value() {
+        // Without `--all`, journalctl prints `[N blob data]` for a message
+        // with `\r`, BEL or invalid UTF-8 — and the scanner never sees it.
+        let cmd = j(Some("media-01")).command();
+        assert!(
+            cmd.contains(&"--all".to_string()),
+            "a line with a control character would be read as `[N blob data]`: {cmd:?}"
+        );
     }
 }
