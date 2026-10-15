@@ -53,9 +53,10 @@ OPTIONS:
                               (default: journal,loki,sessions for scan,
                               journal for sensor — files is never picked by
                               default, it needs --files)
-        --machine NAME       scan a guest's journal via `journalctl -M NAME`
-                              instead of the host's own; repeatable, several
-                              guests can be scanned in one run
+        --machine NAME       also scan a guest's journal via
+                              `journalctl -M NAME`, in addition to the host's
+                              own; repeatable, several guests can be scanned
+                              in one run
         --secrets-repo PATH  read secrets via sops from a homeserver-secrets
                               checkout instead of the local /run/secrets
         --secrets-root PATH  an ADDITIONAL runtime secrets root to search
@@ -202,20 +203,22 @@ fn build_sources(
     for n in names {
         match n.as_str() {
             "journal" => {
-                if machines.is_empty() {
+                // THE HOST JOURNAL ALWAYS, THE GUESTS IN ADDITION (audit 4,
+                // B221). Until 0.2.2 `--machine` replaced the host: a sensor
+                // that listed its guests never read the journal of the
+                // machine it ran on — and that is where everything a log
+                // store's mask misses lies raw.
+                out.push(Box::new(Journal {
+                    machine: None,
+                    since: since.to_string(),
+                    via_ssh: ssh.clone(),
+                }));
+                for m in machines {
                     out.push(Box::new(Journal {
-                        machine: None,
+                        machine: Some(m.clone()),
                         since: since.to_string(),
                         via_ssh: ssh.clone(),
                     }));
-                } else {
-                    for m in machines {
-                        out.push(Box::new(Journal {
-                            machine: Some(m.clone()),
-                            since: since.to_string(),
-                            via_ssh: ssh.clone(),
-                        }));
-                    }
                 }
             }
             "loki" => out.push(Box::new(Loki {
@@ -623,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn one_machine_yields_one_guest_source() {
+    fn one_machine_yields_the_host_and_one_guest_source() {
         let sources = build_sources(
             &["journal".to_string()],
             "7d",
@@ -634,12 +637,13 @@ mod tests {
             &["media-01".to_string()],
         )
         .unwrap();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].locate("line").1, "media-01");
+        assert_eq!(sources.len(), 2, "the host journal stays in (B221)");
+        assert_eq!(sources[0].locate("line").1, "local");
+        assert_eq!(sources[1].locate("line").1, "media-01");
     }
 
     #[test]
-    fn two_machines_yield_two_guest_sources() {
+    fn two_machines_yield_the_host_and_two_guest_sources() {
         let sources = build_sources(
             &["journal".to_string()],
             "7d",
@@ -650,9 +654,10 @@ mod tests {
             &["media-01".to_string(), "jelly-01".to_string()],
         )
         .unwrap();
-        assert_eq!(sources.len(), 2);
-        assert_eq!(sources[0].locate("line").1, "media-01");
-        assert_eq!(sources[1].locate("line").1, "jelly-01");
+        assert_eq!(sources.len(), 3);
+        assert_eq!(sources[0].locate("line").1, "local");
+        assert_eq!(sources[1].locate("line").1, "media-01");
+        assert_eq!(sources[2].locate("line").1, "jelly-01");
     }
 
     // ------------------------------------------------ audit 3 (2026-09-27)

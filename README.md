@@ -74,7 +74,7 @@ a suppressed alert.
 
 | Source | What | Reads |
 |---|---|---|
-| `journal` | the host's own journal, or one or more guests' via `journalctl -M` (`--machine`, repeatable) | locally, streamed, or over `ssh` |
+| `journal` | the host's own journal, always — plus one or more guests' via `journalctl -M` (`--machine`, repeatable) | locally, streamed, or over `ssh` |
 | `loki` | the aggregated log store, which also proves whether a log-scrubbing regex mask elsewhere actually holds | `curl`, optionally wrapped in `ssh` — Loki commonly listens on an address the machine running leakwatch cannot reach directly. The window is paged oldest-first (5000 entries per request) and every log line is scanned as its own line; a full page that cannot be paged past (all entries on one timestamp) is a tool failure, not a truncated clean result |
 | `sessions` | Claude session transcripts, where the household's real chat leaks actually landed | streamed, files opened lazily (972 files would cost 972 descriptors at once) |
 | `files` | log files that never pass through Loki, e.g. Caddy's access log | glob patterns, `--files`, repeatable; not selected by default because a guessed default path is not a finding |
@@ -93,9 +93,10 @@ leakwatch sensor [OPTIONS]
     --source LIST        comma-separated: journal,loki,sessions,files
                           (default: journal,loki,sessions for scan, journal
                           for sensor — files is never picked by default)
-    --machine NAME       scan a guest's journal via `journalctl -M NAME`
-                          instead of the host's own; repeatable, several
-                          guests can be scanned in one run
+    --machine NAME       also scan a guest's journal via
+                          `journalctl -M NAME`, in addition to the host's
+                          own; repeatable, several guests can be scanned
+                          in one run
     --secrets-repo PATH  read secrets via sops from a homeserver-secrets
                           checkout instead of the local /run/secrets
     --secrets-root PATH  an ADDITIONAL runtime secrets root, searched
@@ -206,8 +207,9 @@ as a stale exception instead — a message pointing at the wrong cause.
 - Spellings not searched: UTF-16, case-changed copies, double encodings,
   Base64 wrapped at 76 columns, and anything compressed or encrypted.
 - `sessions` and `files` read the local filesystem only; `journal` reads
-  the local host or one or more named guests via `journalctl -M`
-  (`--machine`); `journal` and `loki` can both be reached over `ssh`.
+  the local host and, in addition, any named guests via `journalctl -M`
+  (`--machine`; since 0.2.3 the host is no longer dropped when guests are
+  named); `journal` and `loki` can both be reached over `ssh`.
   Scanning a remote host's `sessions` or `files` means running leakwatch on
   that host.
 - The canary proves a source delivered lines, not that a specific line was
