@@ -17,9 +17,11 @@ use leakwatch::report::{self, Finding};
 use leakwatch::scan::Scanner;
 use leakwatch::secrets::{self, RuntimeSecrets, Secrets, SopsSecrets};
 use leakwatch::sources::Source;
+use leakwatch::sources::alertmanager::Alertmanager;
 use leakwatch::sources::files::Files;
 use leakwatch::sources::journal::Journal;
 use leakwatch::sources::loki::Loki;
+use leakwatch::sources::ntfy::Ntfy;
 use leakwatch::sources::sessions::Sessions;
 use leakwatch::variants::{self, Kind};
 use std::collections::{HashMap, HashSet};
@@ -41,7 +43,8 @@ oneshot (the gast-speicher/dns-abgleich/sicherung pattern).
 
 Every value is searched in plaintext and in its encoded spellings (Base64,
 URL-safe Base64, percent-encoding, JSON escapes, hex; single lines of a
-multi-line value); a report names the spelling, e.g. `name[b64]`.
+multi-line value; Base64 inside a URL and a URL inside a URL); a report
+names the spelling, e.g. `name[b64]`, `name[double]`.
 
 Every run injects its own canary in every spelling and proves, per adapter,
 that each came back AND that the adapter delivered more than the canary.
@@ -49,10 +52,11 @@ A run that cannot prove this is a tool failure, never a clean result.
 
 OPTIONS:
         --since DURATION     e.g. 7d, 1h (scan default: 7d, sensor default: 1h)
-        --source LIST        comma-separated: journal,loki,sessions,files
-                              (default: journal,loki,sessions for scan,
-                              journal for sensor — files is never picked by
-                              default, it needs --files)
+        --source LIST        comma-separated: journal,loki,sessions,files,
+                              ntfy,alertmanager (default: journal,loki,
+                              sessions for scan, journal for sensor — files,
+                              ntfy and alertmanager are never picked by
+                              default, each needs its option below)
         --machine NAME       also scan a guest's journal via
                               `journalctl -M NAME`, in addition to the host's
                               own; repeatable, several guests can be scanned
@@ -69,6 +73,11 @@ OPTIONS:
         --loki-base URL      override the Loki base URL
                               (default: http://localhost:3100)
         --files GLOB         a glob for the files source; repeatable
+        --ntfy-db PATH       ntfy's cache-file for the ntfy source (read
+                              with sqlite3, read-only; over --ssh if given)
+        --alertmanager-base URL
+                             Alertmanager for the alertmanager source, e.g.
+                              http://10.0.20.12:9093 (over --ssh if given)
         --sessions-root PATH override the sessions root
                               (default: ~/.claude/projects)
     -c, --config FILE        exceptions, see README (every one needs a reason)
@@ -98,6 +107,8 @@ struct Args {
     ssh: Option<String>,
     loki_base: Option<String>,
     files: Vec<String>,
+    ntfy_db: Option<String>,
+    alertmanager: Option<String>,
     sessions_root: Option<PathBuf>,
     config: Option<PathBuf>,
     output: Option<PathBuf>,
@@ -117,6 +128,8 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
             Long("ssh") => a.ssh = Some(p.value()?.string()?),
             Long("loki-base") => a.loki_base = Some(p.value()?.string()?),
             Long("files") => a.files.push(p.value()?.string()?),
+            Long("ntfy-db") => a.ntfy_db = Some(p.value()?.string()?),
+            Long("alertmanager-base") => a.alertmanager = Some(p.value()?.string()?),
             Long("sessions-root") => a.sessions_root = Some(p.value()?.into()),
             Short('c') | Long("config") => a.config = Some(p.value()?.into()),
             Long("output") => a.output = Some(p.value()?.into()),
@@ -198,6 +211,8 @@ fn build_sources(
     files: &[String],
     sessions_root: &Option<PathBuf>,
     machines: &[String],
+    ntfy_db: &Option<String>,
+    alertmanager: &Option<String>,
 ) -> Result<Vec<Box<dyn Source>>> {
     let mut out: Vec<Box<dyn Source>> = Vec::new();
     for n in names {
@@ -237,7 +252,23 @@ fn build_sources(
                     globs: files.to_vec(),
                 }));
             }
-            other => anyhow::bail!("unknown source {other} — use journal, loki, sessions or files"),
+            "ntfy" => match ntfy_db {
+                Some(db) => out.push(Box::new(Ntfy {
+                    db: db.clone(),
+                    via_ssh: ssh.clone(),
+                })),
+                None => anyhow::bail!("the ntfy source needs --ntfy-db"),
+            },
+            "alertmanager" => match alertmanager {
+                Some(base) => out.push(Box::new(Alertmanager {
+                    base: base.clone(),
+                    via_ssh: ssh.clone(),
+                })),
+                None => anyhow::bail!("the alertmanager source needs --alertmanager-base"),
+            },
+            other => anyhow::bail!(
+                "unknown source {other} — use journal, loki, sessions, files, ntfy or alertmanager"
+            ),
         }
     }
     Ok(out)
@@ -530,6 +561,8 @@ fn run_scan(a: &Args) -> Result<Outcome> {
         &a.files,
         &a.sessions_root,
         &a.machine,
+        &a.ntfy_db,
+        &a.alertmanager,
     )?;
     let secrets = load_secrets(&a.secrets_repo, &a.secrets_root)?;
     execute(sources, secrets, &config, true)
@@ -551,6 +584,8 @@ fn run_sensor(a: &Args) -> Result<(Outcome, PathBuf)> {
         &a.files,
         &a.sessions_root,
         &a.machine,
+        &a.ntfy_db,
+        &a.alertmanager,
     )?;
     let secrets = load_secrets(&a.secrets_repo, &a.secrets_root)?;
     // No line context from the sensor: its stdout is the host journal, and
@@ -619,6 +654,8 @@ mod tests {
             &[],
             &None,
             &[],
+            &None,
+            &None,
         )
         .unwrap();
         assert_eq!(sources.len(), 1);
@@ -635,6 +672,8 @@ mod tests {
             &[],
             &None,
             &["media-01".to_string()],
+            &None,
+            &None,
         )
         .unwrap();
         assert_eq!(sources.len(), 2, "the host journal stays in (B221)");
@@ -652,12 +691,52 @@ mod tests {
             &[],
             &None,
             &["media-01".to_string(), "jelly-01".to_string()],
+            &None,
+            &None,
         )
         .unwrap();
         assert_eq!(sources.len(), 3);
         assert_eq!(sources[0].locate("line").1, "local");
         assert_eq!(sources[1].locate("line").1, "media-01");
         assert_eq!(sources[2].locate("line").1, "jelly-01");
+    }
+
+    #[test]
+    fn ntfy_and_alertmanager_need_their_option() {
+        for (name, hint) in [
+            ("ntfy", "--ntfy-db"),
+            ("alertmanager", "--alertmanager-base"),
+        ] {
+            let err = build_sources(
+                &[name.to_string()],
+                "1h",
+                &None,
+                "",
+                &[],
+                &None,
+                &[],
+                &None,
+                &None,
+            )
+            .err()
+            .unwrap()
+            .to_string();
+            assert!(err.contains(hint), "{err}");
+        }
+        let s = build_sources(
+            &["ntfy".to_string(), "alertmanager".to_string()],
+            "1h",
+            &None,
+            "",
+            &[],
+            &None,
+            &[],
+            &Some("/d/cache.db".to_string()),
+            &Some("http://am:9093".to_string()),
+        )
+        .unwrap();
+        assert_eq!(s[0].name(), "ntfy");
+        assert_eq!(s[1].name(), "alertmanager");
     }
 
     // ------------------------------------------------ audit 3 (2026-09-27)

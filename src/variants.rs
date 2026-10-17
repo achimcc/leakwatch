@@ -34,9 +34,13 @@ pub enum Kind {
     Hex,
     /// A single line of a multi-line value.
     Line,
+    /// Two encodings stacked (audit 4, B222): Base64 inside a URL (a Basic
+    /// token in a `next=` parameter) and percent-encoding applied twice
+    /// (`%` becomes `%25` when a URL is put into another URL).
+    Double,
 }
 
-pub const ALL_KINDS: [Kind; 7] = [
+pub const ALL_KINDS: [Kind; 8] = [
     Kind::Plain,
     Kind::B64,
     Kind::B64Url,
@@ -44,6 +48,7 @@ pub const ALL_KINDS: [Kind; 7] = [
     Kind::Json,
     Kind::Hex,
     Kind::Line,
+    Kind::Double,
 ];
 
 impl Kind {
@@ -56,6 +61,7 @@ impl Kind {
             Kind::Json => "json",
             Kind::Hex => "hex",
             Kind::Line => "line",
+            Kind::Double => "double",
         }
     }
 
@@ -128,6 +134,17 @@ pub fn spellings(value: &str) -> Vec<(Kind, String)> {
     push(Kind::Json, json(value, JsonStyle::Ascii));
     push(Kind::Hex, hex(bytes, false));
     push(Kind::Hex, hex(bytes, true));
+    // Percent-encoding works character by character, so the encoded window of
+    // a Base64 string is a substring of the encoded whole — the windows stay
+    // valid. A window without `+`/`/` encodes to itself and is deduplicated.
+    for w in b64_windows(bytes, B64_STD) {
+        push(Kind::Double, percent(w.as_bytes(), UNRESERVED, true, false));
+    }
+    let once = percent(bytes, UNRESERVED, true, false);
+    push(
+        Kind::Double,
+        percent(once.as_bytes(), UNRESERVED, true, false),
+    );
     out
 }
 

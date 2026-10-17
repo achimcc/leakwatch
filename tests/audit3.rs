@@ -331,3 +331,86 @@ fn every_variant_name_maps_back_to_the_secret() {
     }
     assert!(s.kinds_of("probe-a").contains(&Kind::B64));
 }
+
+// ------------------------------------------------ audit 4, B222: je Kodierung
+
+fn embeddings(v: &str) -> Vec<(&'static str, String)> {
+    let b = v.as_bytes();
+    let mut out = vec![("plain", format!("x={v};"))];
+    for prefix in ["", "u", "u:"] {
+        let data = format!("{prefix}{v}!");
+        out.push((
+            "b64",
+            format!("Basic {}", variants::b64(data.as_bytes(), B64_STD)),
+        ));
+        out.push((
+            "b64url",
+            format!("t={}", variants::b64(data.as_bytes(), variants::B64_URL)),
+        ));
+        let token = variants::b64(data.as_bytes(), B64_STD);
+        out.push((
+            "url(b64)",
+            format!(
+                "next={}",
+                variants::percent(token.as_bytes(), variants::UNRESERVED, true, false)
+            ),
+        ));
+    }
+    for (safe, upper, plus) in [
+        (variants::UNRESERVED, true, false),
+        (variants::UNRESERVED, false, false),
+        (variants::UNRESERVED_SLASH, true, false),
+        (variants::URI_COMPONENT, true, false),
+        (variants::FORM, true, true),
+    ] {
+        out.push((
+            "url",
+            format!("pw={}&x", variants::percent(b, safe, upper, plus)),
+        ));
+    }
+    let once = variants::percent(b, variants::UNRESERVED, true, false);
+    out.push((
+        "url(url)",
+        format!(
+            "next={}",
+            variants::percent(once.as_bytes(), variants::UNRESERVED, true, false)
+        ),
+    ));
+    for style in [
+        variants::JsonStyle::Standard,
+        variants::JsonStyle::Slash,
+        variants::JsonStyle::HtmlSafe,
+        variants::JsonStyle::Ascii,
+    ] {
+        out.push((
+            "json",
+            format!("{{\"pw\":\"{}\"}}", variants::json(v, style)),
+        ));
+    }
+    out.push(("hex", format!("dump {}", variants::hex(b, false))));
+    out.push(("HEX", format!("dump {}", variants::hex(b, true))));
+    out
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// For any value and every way a service embeds it — plain, Base64 in
+    /// each alignment, percent-encoded in each style, JSON-escaped, hex, and
+    /// the stacked encodings — the scanner finds the secret.
+    #[test]
+    fn every_embedding_of_any_value_is_found(
+        v in "[A-Za-z0-9@/&\"%+=._:~-][A-Za-z0-9@/&\"%+= ._:~-]{6,22}[A-Za-z0-9@/&\"%+=._:~-]",
+        filler in "[ -~]{0,12}",
+    ) {
+        let scanner = Scanner::new(vec![("geheim".to_string(), v.clone())]).unwrap();
+        for (how, text) in embeddings(&v) {
+            let line = format!("{filler}{text} end");
+            let hit = scanner
+                .scan_line(&line)
+                .iter()
+                .any(|(n, _)| variants::base_name(n) == "geheim");
+            prop_assert!(hit, "not found as {how}: value {v:?}, line {line:?}");
+        }
+    }
+}

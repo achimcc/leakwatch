@@ -20,8 +20,11 @@ Basic base64(user:password)` is found), percent-encoding (several common
 safe sets, upper- and lowercase, `+` for a space), JSON escapes (standard,
 `\/`, Go's `\u0026`, ASCII-only) and hex (lower- and uppercase). A value
 that spans several lines is additionally searched line by line, for the
-lines shaped like key material. A report names the spelling that leaked:
-`radarr-apikey[b64]`.
+lines shaped like key material. Two stacked encodings are searched as well
+(`[double]`): Base64 inside a URL — a Basic token in a `next=` parameter —
+and a URL put into another URL (`%` becomes `%25`). A property test holds
+every one of these embeddings against random values. A report names the
+spelling that leaked: `radarr-apikey[b64]`.
 
 ## Why no HMAC
 
@@ -78,6 +81,8 @@ a suppressed alert.
 | `loki` | the aggregated log store, which also proves whether a log-scrubbing regex mask elsewhere actually holds | `curl`, optionally wrapped in `ssh` — Loki commonly listens on an address the machine running leakwatch cannot reach directly. The window is paged oldest-first (5000 entries per request) and every log line is scanned as its own line; a full page that cannot be paged past (all entries on one timestamp) is a tool failure, not a truncated clean result |
 | `sessions` | Claude session transcripts, where the household's real chat leaks actually landed | streamed, files opened lazily (972 files would cost 972 descriptors at once) |
 | `files` | log files that never pass through Loki, e.g. Caddy's access log or a guest's log read from the host under `/var/lib/machines/<guest>/` | glob patterns, `--files`, repeatable: `*` and `?` within a segment, `**` across directories; symbolic links are not followed (a guest could point one at a host file); `.gz` is read through `gzip -dc`, `.zst`/`.xz`/`.bz2` are an error, not a silent skip; each finding names its file. Not selected by default because a guessed default path is not a finding |
+| `ntfy` | ntfy's message cache — every push that went out, title, text, click URL and actions | `--ntfy-db PATH`, read with `sqlite3 -readonly` and `immutable=1` (never locks or changes the live database); the whole cache, since ntfy expires it itself; a finding names the message id |
+| `alertmanager` | labels and annotations of every alert Alertmanager holds, firing, silenced or inhibited — what goes out by mail and push | `--alertmanager-base URL`, `GET /api/v2/alerts`; the always-firing Watchdog keeps it from looking silent; a finding names the fingerprint. Sent and resolved notifications are not kept by Alertmanager and cannot be read |
 
 None of the adapters ever puts a secret value into a subprocess's argv —
 that is itself a leak (systemd logs a transient unit's argv, and 26 lines

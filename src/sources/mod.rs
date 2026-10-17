@@ -1,9 +1,11 @@
 //! Where lines come from. Four adapters, all streaming, none of them ever
 //! carrying a secret in argv.
 
+pub mod alertmanager;
 pub mod files;
 pub mod journal;
 pub mod loki;
+pub mod ntfy;
 pub mod sessions;
 
 use anyhow::Result;

@@ -131,6 +131,31 @@ pub fn probes(scanner: &Scanner) -> Vec<Probe> {
             ),
         ));
     }
+    // Double encodings: a Basic token inside a URL, and a URL inside a URL.
+    for prefix in ["", "u", "u:"] {
+        let data = format!("{prefix}{CANARY_VALUE_ENCODED}!");
+        let token = variants::b64(data.as_bytes(), variants::B64_STD);
+        // Only an alignment whose token carries `+` or `/` proves the stacked
+        // spelling; without them the URL form IS the Base64 form.
+        if !token.contains(['+', '/']) {
+            continue;
+        }
+        raw.push((
+            Kind::Double,
+            format!(
+                "GET /login?next={}",
+                variants::percent(token.as_bytes(), variants::UNRESERVED, true, false)
+            ),
+        ));
+    }
+    let once = variants::percent(e, variants::UNRESERVED, true, false);
+    raw.push((
+        Kind::Double,
+        format!(
+            "GET /login?next={}",
+            variants::percent(once.as_bytes(), variants::UNRESERVED, true, false)
+        ),
+    ));
     for upper in [false, true] {
         raw.push((
             Kind::Hex,
