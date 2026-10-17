@@ -16,7 +16,7 @@
 //! `.xz`, `.bz2`) is an adapter error naming the file — exit 2, not a
 //! shorter window reported as clean. Narrow the glob or decompress.
 
-use super::{Source, spawn};
+use super::{Source, spawn_with_stdin};
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
@@ -27,6 +27,38 @@ pub struct Files {
 
 /// Separator between the file prefix and the line.
 const SEP: u8 = b'\t';
+
+/// The longest line read in one piece. A guest's log (or a gzip bomb behind a
+/// `.gz`) could otherwise grow one line until memory runs out. The rest of an
+/// over-long line is skipped up to its newline; a secret straddling the cut
+/// is missed — the price of a bound, and 1 MiB is far beyond any log line.
+const MAX_LINE: usize = 1 << 20;
+
+/// The file name as the line prefix, with control characters (`\t`, `\n`,
+/// `\r`, …) replaced by `?`. A guest names its own files; a tab or newline
+/// in a name would otherwise forge the framing that `file_of` cuts back off.
+fn prefix_of(path: &Path) -> Vec<u8> {
+    path.to_string_lossy()
+        .bytes()
+        .map(|b| if b < 0x20 || b == 0x7f { b'?' } else { b })
+        .collect()
+}
+
+/// Drop the rest of a line that hit [`MAX_LINE`].
+fn skip_to_newline(reader: &mut dyn BufRead) -> std::io::Result<()> {
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if let Some(i) = buf.iter().position(|&b| b == b'\n') {
+            reader.consume(i + 1);
+            return Ok(());
+        }
+        let n = buf.len();
+        reader.consume(n);
+    }
+}
 
 impl Files {
     /// Resolve the globs. `*` and `?` match within one path segment, `**`
@@ -179,19 +211,61 @@ pub fn opening(path: &Path) -> Opening {
     }
 }
 
+/// Open `path` for reading without following a symbolic link ANYWHERE in it,
+/// and only if it is a regular file — decided on the open descriptor, not on
+/// the name. Between expanding the glob and opening, a guest can swap a file
+/// for a link or a FIFO; the check in `expand` alone would be a TOCTOU.
+/// `openat2(RESOLVE_NO_SYMLINKS)` refuses every link in the path,
+/// `O_NONBLOCK` keeps a planted FIFO from blocking the open, and `fstat`
+/// decides. Under a unit with `RestrictSUIDSGID=` openat2 is ENOSYS
+/// (homeserver caveat `restrictsuidsgid-sperrt-openat2`) — that is an error
+/// here, never a fallback to a following open.
+pub fn open_nofollow(path: &Path) -> Result<std::fs::File> {
+    use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
+    use rustix::io::Errno;
+    let fd = openat2(
+        CWD,
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|e| match e {
+        Errno::LOOP | Errno::XDEV => anyhow::anyhow!(
+            "{} has a symbolic link in its path — not followed (a guest could point it at a host file)",
+            path.display()
+        ),
+        Errno::NOSYS | Errno::PERM => anyhow::anyhow!(
+            "{}: openat2 is not available here ({e}) — refusing to fall back to an open that follows links",
+            path.display()
+        ),
+        other => anyhow::anyhow!("opening {}: {other}", path.display()),
+    })?;
+    let file = std::fs::File::from(fd);
+    let meta = file
+        .metadata()
+        .with_context(|| format!("fstat {}", path.display()))?;
+    if !meta.file_type().is_file() {
+        bail!(
+            "{} is not a regular file (any more) — not read",
+            path.display()
+        );
+    }
+    Ok(file)
+}
+
 fn open_one(path: &Path) -> Result<Box<dyn BufRead>> {
     match opening(path) {
         Opening::Plain => {
-            let f =
-                std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+            let f = open_nofollow(path)?;
             Ok(Box::new(std::io::BufReader::new(f)))
         }
-        Opening::Gzip => spawn(&[
-            "gzip".to_string(),
-            "-dc".to_string(),
-            path.to_string_lossy().to_string(),
-        ])
-        .with_context(|| format!("decompressing {}", path.display())),
+        // gzip reads the descriptor WE opened on stdin; it never sees the path.
+        Opening::Gzip => {
+            let f = open_nofollow(path)?;
+            spawn_with_stdin(&["gzip".to_string(), "-dc".to_string()], f.into())
+                .with_context(|| format!("decompressing {}", path.display()))
+        }
         Opening::Unreadable(what) => bail!(
             "{} is {what}-compressed and this adapter cannot read it — \
              narrow the glob or decompress it; a skipped file would be a \
@@ -231,7 +305,7 @@ impl PrefixedFiles {
                     return Ok(false);
                 };
                 let reader = open_one(&path).map_err(std::io::Error::other)?;
-                let mut prefix = path.to_string_lossy().as_bytes().to_vec();
+                let mut prefix = prefix_of(&path);
                 prefix.push(SEP);
                 self.current = Some((prefix, reader));
             }
@@ -239,10 +313,16 @@ impl PrefixedFiles {
             self.pending.clear();
             self.pending.extend_from_slice(prefix);
             let before = self.pending.len();
-            let n = reader.read_until(b'\n', &mut self.pending)?;
+            let n = reader
+                .by_ref()
+                .take(MAX_LINE as u64)
+                .read_until(b'\n', &mut self.pending)?;
             if n == 0 {
                 self.current = None;
                 continue;
+            }
+            if n == MAX_LINE && self.pending.last() != Some(&b'\n') {
+                skip_to_newline(reader.as_mut())?;
             }
             if self.pending.last() != Some(&b'\n') {
                 self.pending.push(b'\n');
@@ -497,5 +577,54 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert_eq!(got, vec!["echt.log".to_string()]);
+    }
+
+    #[test]
+    fn a_file_swapped_for_a_link_after_the_glob_is_refused_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let aussen = tempfile::tempdir().unwrap();
+        std::fs::write(aussen.path().join("geheim"), "x\n").unwrap();
+        let p = dir.path().join("access.log");
+        std::os::unix::fs::symlink(aussen.path().join("geheim"), &p).unwrap();
+        let err = open_nofollow(&p).unwrap_err().to_string();
+        assert!(err.contains("symbolic link"), "{err}");
+        // A link in a directory component, too.
+        std::os::unix::fs::symlink(aussen.path(), dir.path().join("verz")).unwrap();
+        assert!(open_nofollow(&dir.path().join("verz/geheim")).is_err());
+    }
+
+    #[test]
+    fn a_fifo_does_not_block_and_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("access.log");
+        let ok = std::process::Command::new("mkfifo")
+            .arg(&p)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let err = open_nofollow(&p).unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn a_control_character_in_a_file_name_cannot_forge_the_frame() {
+        let pre = prefix_of(Path::new("/var/log/a\tb\nc.log"));
+        assert_eq!(pre, b"/var/log/a?b?c.log".to_vec());
+    }
+
+    #[test]
+    fn an_over_long_line_is_cut_and_the_next_line_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("lang.log");
+        let mut inhalt = vec![b'a'; MAX_LINE + 4096];
+        inhalt.extend_from_slice(b"\nzweite\n");
+        std::fs::write(&p, &inhalt).unwrap();
+        let mut r = PrefixedFiles::new(vec![p]);
+        let mut s = Vec::new();
+        r.read_to_end(&mut s).unwrap();
+        let zeilen: Vec<&[u8]> = s.split(|&b| b == b'\n').filter(|z| !z.is_empty()).collect();
+        assert_eq!(zeilen.len(), 2);
+        assert!(zeilen[0].len() <= MAX_LINE + 300);
+        assert!(zeilen[1].ends_with(b"zweite"));
     }
 }

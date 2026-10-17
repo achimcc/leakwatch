@@ -159,6 +159,7 @@ dependencies = [
  "anyhow",
  "lexopt",
  "proptest",
+ "rustix",
  "serde",
  "serde_json",
  "serde_norway",

@@ -78,9 +78,19 @@ impl std::io::Read for ChildReader {
 /// non-zero exit surfaces as an `io::Error` on the read that hits EOF,
 /// rather than as a silently empty stream.
 pub(crate) fn spawn(argv: &[String]) -> Result<Box<dyn BufRead>> {
+    spawn_with_stdin(argv, std::process::Stdio::inherit())
+}
+
+/// [`spawn`] with the child's stdin given — e.g. a file the caller opened
+/// itself, so that the child never resolves a path of its own.
+pub(crate) fn spawn_with_stdin(
+    argv: &[String],
+    stdin: std::process::Stdio,
+) -> Result<Box<dyn BufRead>> {
     use std::process::{Command, Stdio};
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
