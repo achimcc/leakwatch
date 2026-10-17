@@ -77,7 +77,7 @@ a suppressed alert.
 | `journal` | the host's own journal, always — plus one or more guests' via `journalctl -M` (`--machine`, repeatable) | locally, streamed, or over `ssh` |
 | `loki` | the aggregated log store, which also proves whether a log-scrubbing regex mask elsewhere actually holds | `curl`, optionally wrapped in `ssh` — Loki commonly listens on an address the machine running leakwatch cannot reach directly. The window is paged oldest-first (5000 entries per request) and every log line is scanned as its own line; a full page that cannot be paged past (all entries on one timestamp) is a tool failure, not a truncated clean result |
 | `sessions` | Claude session transcripts, where the household's real chat leaks actually landed | streamed, files opened lazily (972 files would cost 972 descriptors at once) |
-| `files` | log files that never pass through Loki, e.g. Caddy's access log | glob patterns, `--files`, repeatable; not selected by default because a guessed default path is not a finding |
+| `files` | log files that never pass through Loki, e.g. Caddy's access log or a guest's log read from the host under `/var/lib/machines/<guest>/` | glob patterns, `--files`, repeatable: `*` and `?` within a segment, `**` across directories; symbolic links are not followed (a guest could point one at a host file); `.gz` is read through `gzip -dc`, `.zst`/`.xz`/`.bz2` are an error, not a silent skip; each finding names its file. Not selected by default because a guessed default path is not a finding |
 
 None of the adapters ever puts a secret value into a subprocess's argv —
 that is itself a leak (systemd logs a transient unit's argv, and 26 lines
