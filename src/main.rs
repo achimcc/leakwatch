@@ -16,6 +16,7 @@ use leakwatch::metrics;
 use leakwatch::report::{self, Finding};
 use leakwatch::scan::Scanner;
 use leakwatch::secrets::{self, RuntimeSecrets, Secrets, SopsSecrets};
+use leakwatch::sieve::{Counts, Sieve};
 use leakwatch::sources::Source;
 use leakwatch::sources::alertmanager::Alertmanager;
 use leakwatch::sources::files::Files;
@@ -34,6 +35,7 @@ leakwatch — finds secrets in logs by matching their real plaintext values
 USAGE:
     leakwatch scan   [OPTIONS]
     leakwatch sensor [OPTIONS]
+    leakwatch sieve  [--secrets-repo PATH | --secrets-root PATH...] [--no-guess] [--allow-partial]
 
 scan runs a full audit and prints every finding as text, with the line
 around it redacted. sensor runs the same audit, prints findings WITHOUT any
@@ -49,6 +51,23 @@ names the spelling, e.g. `name[b64]`, `name[double]`.
 Every run injects its own canary in every spelling and proves, per adapter,
 that each came back AND that the adapter delivered more than the canary.
 A run that cannot prove this is a tool failure, never a clean result.
+
+sieve reads text on stdin and writes it to stdout with every known value, in
+every spelling, replaced by `<REDACTED:name>` — the name of the secret, so
+the reader sees WHICH key stood there — and, unless --no-guess, every
+secret-looking value in a telling context (an Authorization header, a
+`token=` assignment, a URL password or query key, a JWT) by `<REDACTED?:kind>`.
+Known values come first; where a guess and a known value overlap, the union
+is masked under the known name. Line by line, nothing held back: a value
+broken across two INPUT lines passes the first layer (journalctl and Loki
+never wrap). Before the first line the canary goes through the sieve in
+every spelling; if any survives, nothing is printed (exit 2). Run it where
+the values are: as root on the host, or with --secrets-repo on the
+workstation. With sieve, --secrets-root REPLACES the default roots.
+`leakwatch.toml` is not read: an exception there means `not a finding`,
+and the sieve masks identifiers too — the mask names them. The closing
+line on stderr always says how many values were loaded; a non-root caller
+who sees secrets it cannot read gets exit 2 unless --allow-partial.
 
 OPTIONS:
         --since DURATION     e.g. 7d, 1h (scan default: 7d, sensor default: 1h)
@@ -80,6 +99,9 @@ OPTIONS:
                               http://10.0.20.12:9093 (over --ssh if given)
         --sessions-root PATH override the sessions root
                               (default: ~/.claude/projects)
+        --no-guess           sieve: only known values, no context guesses
+        --allow-partial      sieve: go on although some secret files could
+                              not be read (the closing line says how many)
     -c, --config FILE        exceptions, see README (every one needs a reason)
         --output PATH        sensor: where to write the textfile metric
                               (default: /var/lib/node-exporter/leakwatch.prom)
@@ -90,7 +112,8 @@ EXIT STATUS:
     0  no findings, every canary found, no source silent
     1  findings
     2  tool failure — canary missing or not found, a source silent, unused
-       exceptions, or an adapter error
+       exceptions, or an adapter error; sieve: no values, unreadable values
+       without --allow-partial, or a canary that survived (nothing printed)
 ";
 
 const DEFAULT_LOKI_BASE: &str = "http://localhost:3100";
@@ -112,6 +135,8 @@ struct Args {
     sessions_root: Option<PathBuf>,
     config: Option<PathBuf>,
     output: Option<PathBuf>,
+    no_guess: bool,
+    allow_partial: bool,
 }
 
 fn parse_args() -> Result<Option<Args>, lexopt::Error> {
@@ -133,6 +158,8 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
             Long("sessions-root") => a.sessions_root = Some(p.value()?.into()),
             Short('c') | Long("config") => a.config = Some(p.value()?.into()),
             Long("output") => a.output = Some(p.value()?.into()),
+            Long("no-guess") => a.no_guess = true,
+            Long("allow-partial") => a.allow_partial = true,
             Short('h') | Long("help") => {
                 print!("{HELP}");
                 return Ok(None);
@@ -598,8 +625,69 @@ fn run_sensor(a: &Args) -> Result<(Outcome, PathBuf)> {
     Ok((outcome, output))
 }
 
+/// `sieve`: stdin through the sieve to stdout, line by line.
+fn run_sieve(a: &Args) -> Result<u8> {
+    use std::io::{BufRead, Write};
+    let (values, unreadable) = match &a.secrets_repo {
+        Some(r) => (SopsSecrets { repo: r.clone() }.load()?, 0),
+        None => {
+            // Unlike scan, a named root REPLACES the defaults: the tests and
+            // a workstation run must not pick up /run/secrets by accident.
+            let roots = if a.secrets_root.is_empty() {
+                default_runtime_roots()
+            } else {
+                a.secrets_root.clone()
+            };
+            match (RuntimeSecrets { roots }).load_detailed() {
+                Ok(l) => (l.values, l.unreadable),
+                Err(_) => (Vec::new(), 0),
+            }
+        }
+    };
+    if values.is_empty() {
+        anyhow::bail!(
+            "nothing to sieve with — are you root on the host, or did you pass --secrets-repo?"
+        );
+    }
+    if unreadable > 0 && !a.allow_partial {
+        anyhow::bail!(
+            "{unreadable} secrets seen but not readable — run as root, or pass --allow-partial"
+        );
+    }
+    let loaded = values.len();
+    let sieve = Sieve::new(values, !a.no_guess)?;
+    if let Err(e) = sieve.prove() {
+        anyhow::bail!("{e}");
+    }
+    let stdin = std::io::stdin().lock();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut counts = Counts::default();
+    for line in stdin.split(b'\n') {
+        let line = line?;
+        let line = String::from_utf8_lossy(&line);
+        let masked = sieve.sieve_line(&line, &mut counts);
+        if let Err(e) = writeln!(out, "{masked}") {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                break;
+            }
+            return Err(e.into());
+        }
+    }
+    let _ = out.flush();
+    eprintln!(
+        "leakwatch sieve: {} lines, {} known values redacted ({} names), {} guessed; {loaded} secrets loaded, {unreadable} unreadable",
+        counts.lines,
+        counts.known,
+        counts.names.len(),
+        counts.guessed
+    );
+    Ok(0)
+}
+
 fn run_command(a: &Args) -> Result<u8> {
     match a.command.as_str() {
+        "sieve" => run_sieve(a),
         "scan" => {
             let outcome = run_scan(a)?;
             print!("{}", outcome.report);
@@ -617,7 +705,7 @@ fn run_command(a: &Args) -> Result<u8> {
             write_metrics_atomically(&output, &text)?;
             Ok(outcome.exit_code)
         }
-        "" => anyhow::bail!("missing command: scan or sensor — try --help"),
+        "" => anyhow::bail!("missing command: scan, sensor or sieve — try --help"),
         other => anyhow::bail!("unknown command {other} — try --help"),
     }
 }

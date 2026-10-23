@@ -93,6 +93,7 @@ of it once ended up in guest journals).
 ```
 leakwatch scan   [OPTIONS]
 leakwatch sensor [OPTIONS]
+leakwatch sieve  [--secrets-repo PATH | --secrets-root PATH...] [--no-guess] [--allow-partial]
 
     --since DURATION     e.g. 7d, 1h (scan default: 7d, sensor default: 1h)
     --source LIST        comma-separated: journal,loki,sessions,files
@@ -148,6 +149,42 @@ of `foo`; one for `foo[url]` covers only that spelling.
 | `2` | tool failure — canary missing from the scanner, a canary not found for some source, a source that delivered only the canary, an unused exception, or an adapter error |
 
 "Nothing found" and "could not look" are deliberately never the same code.
+
+## sieve: a log line you can paste
+
+Since 0.3.0. `scan` and `sensor` tell you WHERE a secret is; `sieve` lets
+you read the line anyway. Text in on stdin, text out on stdout, every known
+value in every spelling replaced by `<REDACTED:name>` — the NAME of the
+secret, so you see which key stood there, never the value — and, unless
+`--no-guess`, every secret-looking value in a telling context by
+`<REDACTED?:kind>`: an `Authorization` header, a `token=`/`password:`
+assignment, the password in a URL, a query key, a JWT. There is no rule
+for bare hex or Base64 runs: a 40-hex token and a git commit cannot be
+told apart, and a diagnosis of a deploy would turn into `<REDACTED?>`.
+
+```console
+$ ssh root@server 'journalctl -M media-01 -u prowlarr -n 200 --no-pager | leakwatch sieve'
+… Started [systemd-run] curl -H 'X-Api-Key: <REDACTED:arr-radarr-apikey>' http://… 
+leakwatch sieve: 200 lines, 3 known values redacted (2 names), 1 guessed; 217 secrets loaded, 0 unreadable
+```
+
+Known values come first; where a guess overlaps a known value the union is
+masked under the known name, so the tail of a longer token never survives
+and the mask itself is never re-matched as a token. Overlapping values list
+every name (`<REDACTED:smtp-pass,smtp-url>`), except that a rendered
+template (`/run/secrets/rendered/…`, named `rendered/…`) yields to the
+secret it contains. Line by line, nothing held back: a value broken across
+two input lines passes the first layer — journalctl and Loki never wrap.
+
+Before the first line the canary goes through the sieve in every spelling;
+if any survives, nothing is printed and the exit status is 2. The closing
+line on stderr always says how many values were loaded: a non-root caller
+on the host sees `/run/secrets/rendered` but cannot read it, and gets exit
+2 unless `--allow-partial` (then the line says how many were unreadable).
+`leakwatch.toml` is not read by the sieve — an exception there means "not
+a finding", and the sieve masks identifiers too; the mask names them. With
+`sieve`, `--secrets-root` replaces the default roots instead of adding to
+them.
 
 ## Exceptions
 
