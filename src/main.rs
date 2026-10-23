@@ -656,6 +656,19 @@ fn run_sieve(a: &Args) -> Result<u8> {
     }
     let loaded = values.len();
     let sieve = Sieve::new(values, !a.no_guess)?;
+    // The scanner skips values shorter than the minimum — in no spelling.
+    // Those are no protection, and a run must say so rather than count them
+    // as loaded and move on.
+    let searched = sieve
+        .scanner()
+        .pattern_count()
+        .saturating_sub(canary::secrets().len());
+    let short = loaded.saturating_sub(searched);
+    if searched == 0 {
+        anyhow::bail!(
+            "none of the {loaded} loaded values is long enough to search for ({short} too short) — nothing to sieve with"
+        );
+    }
     if let Err(e) = sieve.prove() {
         anyhow::bail!("{e}");
     }
@@ -676,7 +689,7 @@ fn run_sieve(a: &Args) -> Result<u8> {
     }
     let _ = out.flush();
     eprintln!(
-        "leakwatch sieve: {} lines, {} known values redacted ({} names), {} guessed; {loaded} secrets loaded, {unreadable} unreadable",
+        "leakwatch sieve: {} lines, {} known values redacted ({} names), {} guessed; {loaded} secrets loaded ({searched} searched, {short} too short), {unreadable} unreadable",
         counts.lines,
         counts.known,
         counts.names.len(),

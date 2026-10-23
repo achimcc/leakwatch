@@ -142,3 +142,27 @@ fn help_mentions_sieve() {
         "{out}"
     );
 }
+
+/// A value the scanner would never search for (shorter than the minimum)
+/// must not count as protection: with nothing searchable the sieve refuses,
+/// and the closing line always says how many values are actually searched.
+#[test]
+fn short_values_are_reported_and_alone_refused() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("tiny"), "ab12\n").unwrap();
+    let o = sieve(&d, &[], "x\n");
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(2), "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("too short"), "{err}");
+
+    let d = root(false);
+    std::fs::write(d.path().join("tiny"), "ab12\n").unwrap();
+    let o = sieve(&d, &[], "x\n");
+    let (_, err) = text(&o);
+    assert!(o.status.success(), "{err}");
+    assert!(
+        err.contains("2 secrets loaded (1 searched, 1 too short)"),
+        "{err}"
+    );
+}
