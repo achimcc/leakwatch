@@ -133,8 +133,24 @@ impl Scanner {
     ) -> Result<u64> {
         let mut carry = String::new();
         let mut lines = 0u64;
-        for line in r.lines() {
-            let line = line.context("reading a line")?;
+        let mut r = r;
+        let mut raw: Vec<u8> = Vec::new();
+        loop {
+            raw.clear();
+            let n = r.read_until(b'\n', &mut raw).context("reading a line")?;
+            if n == 0 {
+                break;
+            }
+            if raw.last() == Some(&b'\n') {
+                raw.pop();
+                if raw.last() == Some(&b'\r') {
+                    raw.pop();
+                }
+            }
+            // Lossy on purpose: one byte that is not UTF-8 in a journal must
+            // not end the run — a blind sensor is worse than one replacement
+            // character (2026-10-23, req-01).
+            let line = String::from_utf8_lossy(&raw).into_owned();
             lines += 1;
 
             let seam = carry.len();
@@ -320,5 +336,27 @@ mod tests {
         let s = Scanner::new(vec![("pw".into(), "  pass word here  ".into())]).unwrap();
         assert_eq!(s.scan_line("login=pass word here;").len(), 1);
         assert_eq!(s.scan_line("login=passwordhere;").len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod utf8_tests {
+    use super::*;
+
+    /// A journal line with a byte that is not UTF-8 must not end the whole
+    /// run (2026-10-23: req-01's journal did exactly that, the sensor went
+    /// red for an hour). It is read lossily; hits around it are still found.
+    #[test]
+    fn invalid_utf8_line_does_not_abort_the_stream() {
+        let s = Scanner::new(vec![("k".into(), "secret-value-0123456789".into())]).unwrap();
+        let mut input = b"good line\n".to_vec();
+        input.extend_from_slice(b"bad \xff\xfe byte and secret-value-0123456789 here\n");
+        input.extend_from_slice(b"secret-value-0123456789 again\n");
+        let mut hits = 0;
+        let n = s
+            .scan_stream(std::io::Cursor::new(input), &mut |_, _, _| hits += 1)
+            .unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(hits, 2);
     }
 }

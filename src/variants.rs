@@ -172,8 +172,20 @@ pub fn lines(value: &str) -> Vec<String> {
         // way, and the whole line is neither token-shaped nor a pattern.
         let mut candidates = vec![l];
         if let Some(i) = l.find(['=', ':']) {
+            // Only a key whose NAME says secret: a public key, a topic or a
+            // host name in a rendered template is an identifier, and on the
+            // host every ntfy topic would otherwise be "found" in ntfy's
+            // own cache (2026-10-23).
+            let key = l[..i].trim().to_ascii_lowercase();
+            let secret_named = ["privatekey", "private_key", "presharedkey", "preshared_key"]
+                .iter()
+                .any(|k| key.ends_with(k))
+                || (["pass", "secret", "token", "credential"]
+                    .iter()
+                    .any(|w| key.contains(w))
+                    && !key.contains("public"));
             let v = l[i + 1..].trim();
-            if !v.is_empty() {
+            if secret_named && !v.is_empty() {
                 candidates.push(v);
             }
         }
@@ -346,13 +358,22 @@ mod tests {
                 .any(|x| x == "wgPrivateKeyValueLooksLikeBase64ABCDEFGHIJ="),
             "{l:?}"
         );
+        // A PUBLIC key is no secret; an identifier (a topic, a host name) in
+        // a rendered template neither — only secret-named keys count, or a
+        // run on the host reports every ntfy topic in ntfy's own cache
+        // (2026-10-23, leakwatch.service red after 0.3.3).
         assert!(
-            l.iter()
+            !l.iter()
                 .any(|x| x == "otherKeyValueXYZ0123456789abcdefghijklmnop="),
             "{l:?}"
         );
         assert!(!l.iter().any(|x| x.contains("10.2.0.2")), "{l:?}");
         assert!(!l.iter().any(|x| x.contains("vpn.example")), "{l:?}");
+        let tpl = "NTFY_TOPIC=alarmeTopicName0123456789abcdef\nSMTP_PASSWORD=pw0123456789abcdefghij\nAPI_TOKEN: tok0123456789abcdefghij\n";
+        let l = lines(tpl);
+        assert!(!l.iter().any(|x| x.contains("alarmeTopicName")), "{l:?}");
+        assert!(l.iter().any(|x| x == "pw0123456789abcdefghij"), "{l:?}");
+        assert!(l.iter().any(|x| x == "tok0123456789abcdefghij"), "{l:?}");
     }
 
     #[test]
