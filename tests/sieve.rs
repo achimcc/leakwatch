@@ -47,7 +47,12 @@ fn text(o: &Output) -> (String, String) {
 /// (/run/secrets) must not be read by the tests, so every call names a
 /// `--secrets-root`; on a machine without /run/secrets that is all there is.
 fn sieve(dir: &tempfile::TempDir, extra: &[&str], input: &str) -> Output {
-    let mut args = vec!["sieve", "--secrets-root", dir.path().to_str().unwrap()];
+    let mut args = vec![
+        "sieve",
+        "--no-default-roots",
+        "--secrets-root",
+        dir.path().to_str().unwrap(),
+    ];
     args.extend_from_slice(extra);
     run(&args, input)
 }
@@ -141,6 +146,29 @@ fn help_mentions_sieve() {
         out.contains("sieve") && out.contains("--allow-partial"),
         "{out}"
     );
+}
+
+/// Review 2026-10-23: a multi-line secret (a wg-quick configuration) is
+/// masked by the value of its `PrivateKey = …` line, and the closing line
+/// says how many loaded values span several lines.
+#[test]
+fn wireguard_private_key_is_masked_and_multiline_is_counted() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(
+        d.path().join("vpn-conf"),
+        "[Interface]\nPrivateKey = wgPrivateKeyValueLooksLikeBase64ABCDEFGHIJ=\nAddress = 10.2.0.2/32\n",
+    )
+    .unwrap();
+    let o = sieve(
+        &d,
+        &[],
+        "wg: PrivateKey = wgPrivateKeyValueLooksLikeBase64ABCDEFGHIJ= set\nwg: wgPrivateKeyValueLooksLikeBase64ABCDEFGHIJ= alone\n",
+    );
+    let (out, err) = text(&o);
+    assert!(o.status.success(), "{err}");
+    assert!(!out.contains("wgPrivateKeyValue"), "{out}");
+    assert_eq!(out.matches("<REDACTED:vpn-conf>").count(), 2, "{out}");
+    assert!(err.contains("1 multi-line"), "{err}");
 }
 
 /// A value the scanner would never search for (shorter than the minimum)

@@ -35,7 +35,7 @@ leakwatch — finds secrets in logs by matching their real plaintext values
 USAGE:
     leakwatch scan   [OPTIONS]
     leakwatch sensor [OPTIONS]
-    leakwatch sieve  [--secrets-repo PATH | --secrets-root PATH...] [--no-guess] [--allow-partial]
+    leakwatch sieve  [--secrets-repo PATH | --secrets-root PATH...] [--no-default-roots] [--no-guess] [--allow-partial]
 
 scan runs a full audit and prints every finding as text, with the line
 around it redacted. sensor runs the same audit, prints findings WITHOUT any
@@ -63,8 +63,11 @@ broken across two INPUT lines passes the first layer (journalctl and Loki
 never wrap). Before the first line the canary goes through the sieve in
 every spelling; if any survives, nothing is printed (exit 2). Run it where
 the values are: as root on the host, or with --secrets-repo on the
-workstation. With sieve, --secrets-root REPLACES the default roots.
-`leakwatch.toml` is not read: an exception there means `not a finding`,
+workstation. --secrets-root adds to the default roots as in scan;
+--no-default-roots reads only the named ones. Values shorter than 8 bytes are
+never masked, in no spelling; the closing line counts them, and the values
+that span several lines (found by their key-shaped lines and the values of
+their `k = v` lines). `leakwatch.toml` is not read: an exception there means `not a finding`,
 and the sieve masks identifiers too — the mask names them. The closing
 line on stderr always says how many values were loaded; a non-root caller
 who sees secrets it cannot read gets exit 2 unless --allow-partial.
@@ -99,6 +102,8 @@ OPTIONS:
                               http://10.0.20.12:9093 (over --ssh if given)
         --sessions-root PATH override the sessions root
                               (default: ~/.claude/projects)
+        --no-default-roots   sieve: read only the --secrets-root given, not
+                              /run/secrets and /run/secrets/rendered
         --no-guess           sieve: only known values, no context guesses
         --allow-partial      sieve: go on although some secret files could
                               not be read (the closing line says how many)
@@ -137,6 +142,7 @@ struct Args {
     output: Option<PathBuf>,
     no_guess: bool,
     allow_partial: bool,
+    no_default_roots: bool,
 }
 
 fn parse_args() -> Result<Option<Args>, lexopt::Error> {
@@ -159,6 +165,7 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
             Short('c') | Long("config") => a.config = Some(p.value()?.into()),
             Long("output") => a.output = Some(p.value()?.into()),
             Long("no-guess") => a.no_guess = true,
+            Long("no-default-roots") => a.no_default_roots = true,
             Long("allow-partial") => a.allow_partial = true,
             Short('h') | Long("help") => {
                 print!("{HELP}");
@@ -631,13 +638,14 @@ fn run_sieve(a: &Args) -> Result<u8> {
     let (values, unreadable) = match &a.secrets_repo {
         Some(r) => (SopsSecrets { repo: r.clone() }.load()?, 0),
         None => {
-            // Unlike scan, a named root REPLACES the defaults: the tests and
-            // a workstation run must not pick up /run/secrets by accident.
-            let roots = if a.secrets_root.is_empty() {
-                default_runtime_roots()
+            // Additive like scan (review 2026-10-23: one flag, one meaning);
+            // --no-default-roots is the way to isolate a run (tests).
+            let mut roots = if a.no_default_roots {
+                Vec::new()
             } else {
-                a.secrets_root.clone()
+                default_runtime_roots()
             };
+            roots.extend(a.secrets_root.iter().cloned());
             match (RuntimeSecrets { roots }).load_detailed() {
                 Ok(l) => (l.values, l.unreadable),
                 Err(_) => (Vec::new(), 0),
@@ -655,6 +663,7 @@ fn run_sieve(a: &Args) -> Result<u8> {
         );
     }
     let loaded = values.len();
+    let multiline = values.iter().filter(|(_, v)| v.contains('\n')).count();
     let sieve = Sieve::new(values, !a.no_guess)?;
     // The scanner skips values shorter than the minimum — in no spelling.
     // Those are no protection, and a run must say so rather than count them
@@ -689,7 +698,7 @@ fn run_sieve(a: &Args) -> Result<u8> {
     }
     let _ = out.flush();
     eprintln!(
-        "leakwatch sieve: {} lines, {} known values redacted ({} names), {} guessed; {loaded} secrets loaded ({searched} searched, {short} too short), {unreadable} unreadable",
+        "leakwatch sieve: {} lines, {} known values redacted ({} names), {} guessed; {loaded} secrets loaded ({searched} searched, {short} too short, {multiline} multi-line: masked by their key-shaped lines and assignment values), {unreadable} unreadable",
         counts.lines,
         counts.known,
         counts.names.len(),

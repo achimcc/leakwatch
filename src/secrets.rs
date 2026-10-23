@@ -30,35 +30,59 @@ impl RuntimeSecrets {
         let mut out = Vec::new();
         let mut unreadable = 0;
         for root in &self.roots {
-            let entries = match std::fs::read_dir(root) {
-                Ok(e) => e,
-                Err(_) => {
-                    if root.exists() {
-                        unreadable += 1;
-                    }
-                    continue;
-                }
-            };
             let prefix = if prefix_rendered && root.file_name().is_some_and(|f| f == "rendered") {
                 "rendered/"
             } else {
                 ""
             };
-            for entry in entries.flatten() {
-                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                    continue;
-                }
-                let Ok(mut value) = std::fs::read_to_string(entry.path()) else {
-                    unreadable += 1;
-                    continue;
+            // Recursive since 0.3.2: sops-nix writes a secret `a/b` as
+            // `<root>/a/b`; a subdirectory skipped silently was a gap the
+            // closing line could not show. The `rendered` root is a child
+            // of `/run/secrets` and is read as its own root, not twice.
+            let mut stack = vec![root.clone()];
+            while let Some(dir) = stack.pop() {
+                let entries = match std::fs::read_dir(&dir) {
+                    Ok(e) => e,
+                    Err(_) => {
+                        if dir.exists() {
+                            unreadable += 1;
+                        }
+                        continue;
+                    }
                 };
-                let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
-                // In place, not a trimmed copy: every copy is one more buffer
-                // that outlives its use. `Scanner::new` wipes this one.
-                if value.ends_with('\n') {
-                    value.pop();
+                for entry in entries {
+                    let Ok(entry) = entry else {
+                        unreadable += 1;
+                        continue;
+                    };
+                    let kind = entry.file_type();
+                    if kind.as_ref().is_ok_and(|t| t.is_dir()) {
+                        if self.roots.iter().any(|r| *r == entry.path()) {
+                            continue;
+                        }
+                        stack.push(entry.path());
+                        continue;
+                    }
+                    if !kind.is_ok_and(|t| t.is_file()) {
+                        continue;
+                    }
+                    let Ok(mut value) = std::fs::read_to_string(entry.path()) else {
+                        unreadable += 1;
+                        continue;
+                    };
+                    let rel = entry
+                        .path()
+                        .strip_prefix(root)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| entry.file_name().to_string_lossy().into_owned());
+                    let name = format!("{prefix}{rel}");
+                    // In place, not a trimmed copy: every copy is one more
+                    // buffer that outlives its use. `Scanner::new` wipes it.
+                    if value.ends_with('\n') {
+                        value.pop();
+                    }
+                    out.push((name, value));
                 }
-                out.push((name, value));
             }
         }
         Loaded {
@@ -227,6 +251,27 @@ pub fn multiline_note(values: &[(String, String)]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review 2026-10-23: sops-nix writes a secret `a/b` as `/run/secrets/a/b`;
+    /// a subdirectory is read, named with the slash — never skipped silently.
+    #[test]
+    fn load_detailed_reads_subdirectories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("nested/deep")).unwrap();
+        std::fs::write(
+            dir.path().join("nested/deep/key"),
+            "nested-value-ZYXWVU987654",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("plain"), "plain-value-0123456789").unwrap();
+        let s = RuntimeSecrets {
+            roots: vec![dir.path().to_path_buf()],
+        };
+        let got = s.load_detailed().unwrap();
+        let mut names: Vec<&str> = got.values.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["nested/deep/key", "plain"]);
+    }
 
     #[test]
     fn load_detailed_counts_unreadable_and_prefixes_rendered() {

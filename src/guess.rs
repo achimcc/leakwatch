@@ -38,7 +38,7 @@ static PATTERNS: LazyLock<Vec<(Regex, usize, &'static str)>> = LazyLock::new(|| 
         ),
         (
             Regex::new(
-                r#"(?i)\b(?:x-api-key|x-auth-token|apikey|api_key|api-key|token|access_token|refresh_token|password|passwd|secret|client_secret)["']?\s*[:=]\s*["']?([^\s"'&;,]+)"#,
+                r#"(?i)\b(?:x-api-key|x-auth-token|apikey|api_key|api-key|token|access_token|refresh_token|password|passwd|secret|client_secret|private_?key|preshared_?key)["']?\s*[:=]\s*["']?([^\s"'&;,]+)"#,
             )
             .unwrap(),
             1,
@@ -97,6 +97,15 @@ mod tests {
             kinds(r#"{"client_secret": "s3cr3t", "x": 1}"#),
             vec![("header", "s3cr3t")]
         );
+    }
+
+    #[test]
+    fn wireguard_keys_by_name() {
+        assert_eq!(
+            kinds("PrivateKey = abcDEF0123456789+/abcDEF0123456789+/abcDEF0= ok"),
+            vec![("header", "abcDEF0123456789+/abcDEF0123456789+/abcDEF0=")]
+        );
+        assert_eq!(kinds("PresharedKey=xyz"), vec![("header", "xyz")]);
     }
 
     #[test]

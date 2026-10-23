@@ -164,17 +164,32 @@ pub fn lines(value: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for l in value.lines() {
         let l = l.trim();
-        if l.len() < LINE_MIN_LEN || l.starts_with("-----") {
+        if l.starts_with("-----") {
             continue;
         }
-        let body = l.trim_end_matches('=');
-        let token = body
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'_' | b'-'));
-        let letters = body.bytes().any(|b| b.is_ascii_alphabetic());
-        let digits = body.bytes().any(|b| b.is_ascii_digit());
-        if token && letters && digits && !out.iter().any(|o| o == l) {
-            out.push(l.to_string());
+        // The line itself, or — since 0.3.2 — the value of a `k = v` /
+        // `k: v` line: a wg-quick configuration carries its PrivateKey that
+        // way, and the whole line is neither token-shaped nor a pattern.
+        let mut candidates = vec![l];
+        if let Some(i) = l.find(['=', ':']) {
+            let v = l[i + 1..].trim();
+            if !v.is_empty() {
+                candidates.push(v);
+            }
+        }
+        for c in candidates {
+            if c.len() < LINE_MIN_LEN {
+                continue;
+            }
+            let body = c.trim_end_matches('=');
+            let token = body
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'_' | b'-'));
+            let letters = body.bytes().any(|b| b.is_ascii_alphabetic());
+            let digits = body.bytes().any(|b| b.is_ascii_digit());
+            if token && letters && digits && !out.iter().any(|o| o == c) {
+                out.push(c.to_string());
+            }
         }
     }
     out
@@ -318,6 +333,27 @@ pub fn hex(bytes: &[u8], upper: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review 2026-10-23: a wg-quick configuration is one secret; its
+    /// `PrivateKey = <base64>` line is neither token-only nor a pattern of
+    /// its own — the VALUE part of a `k = v` line has to become one.
+    #[test]
+    fn lines_take_the_value_of_an_assignment() {
+        let conf = "[Interface]\nPrivateKey = wgPrivateKeyValueLooksLikeBase64ABCDEFGHIJ=\nAddress = 10.2.0.2/32\n[Peer]\nPublicKey = otherKeyValueXYZ0123456789abcdefghijklmnop=\nEndpoint = vpn.example:51820\n";
+        let l = lines(conf);
+        assert!(
+            l.iter()
+                .any(|x| x == "wgPrivateKeyValueLooksLikeBase64ABCDEFGHIJ="),
+            "{l:?}"
+        );
+        assert!(
+            l.iter()
+                .any(|x| x == "otherKeyValueXYZ0123456789abcdefghijklmnop="),
+            "{l:?}"
+        );
+        assert!(!l.iter().any(|x| x.contains("10.2.0.2")), "{l:?}");
+        assert!(!l.iter().any(|x| x.contains("vpn.example")), "{l:?}");
+    }
 
     #[test]
     fn base64_matches_known_vectors() {

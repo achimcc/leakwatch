@@ -165,7 +165,7 @@ told apart, and a diagnosis of a deploy would turn into `<REDACTED?>`.
 ```console
 $ ssh root@server 'journalctl -M media-01 -u prowlarr -n 200 --no-pager | leakwatch sieve'
 … Started [systemd-run] curl -H 'X-Api-Key: <REDACTED:arr-radarr-apikey>' http://… 
-leakwatch sieve: 200 lines, 3 known values redacted (2 names), 1 guessed; 217 secrets loaded (203 searched, 14 too short), 0 unreadable
+leakwatch sieve: 200 lines, 3 known values redacted (2 names), 1 guessed; 217 secrets loaded (203 searched, 14 too short, 14 multi-line: masked by their key-shaped lines and assignment values), 0 unreadable
 ```
 
 Known values come first; where a guess overlaps a known value the union is
@@ -184,9 +184,11 @@ Limits; with none searchable the sieve refuses): a non-root caller
 on the host sees `/run/secrets/rendered` but cannot read it, and gets exit
 2 unless `--allow-partial` (then the line says how many were unreadable).
 `leakwatch.toml` is not read by the sieve — an exception there means "not
-a finding", and the sieve masks identifiers too; the mask names them. With
-`sieve`, `--secrets-root` replaces the default roots instead of adding to
-them.
+a finding", and the sieve masks identifiers too; the mask names them.
+`--secrets-root` adds to the default roots as in `scan`; `--no-default-roots`
+reads only the named ones. A value that spans several lines (a wg-quick
+configuration, a PEM key) is masked by its key-shaped lines and by the
+values of its `k = v` lines (0.3.2); the closing line counts such values.
 
 ## Exceptions
 

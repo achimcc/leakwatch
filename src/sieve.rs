@@ -103,13 +103,16 @@ impl Sieve {
         for p in canary::probes(&self.scanner) {
             let mut c = Counts::default();
             let out = self.sieve_line(p.text(), &mut c);
+            // "Found" is not "clean": the output itself must carry no
+            // known value in any spelling (review 2026-10-23).
             let survived = [canary::CANARY_VALUE, canary::CANARY_VALUE_ENCODED]
                 .iter()
                 .any(|v| out.contains(v))
                 || crate::variants::lines(canary::CANARY_VALUE_MULTILINE)
                     .iter()
                     .any(|l| out.contains(l.as_str()))
-                || c.known == 0;
+                || c.known == 0
+                || !self.scanner.scan_line(&out).is_empty();
             if survived {
                 return Err(format!(
                     "canary probe {} survived the sieve — refusing to print",
