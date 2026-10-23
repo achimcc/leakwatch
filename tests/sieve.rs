@@ -190,7 +190,7 @@ fn short_values_are_reported_and_alone_refused() {
     let (_, err) = text(&o);
     assert!(o.status.success(), "{err}");
     assert!(
-        err.contains("2 secrets loaded (1 searched, 1 too short)"),
+        err.contains("2 secrets loaded (1 searched, 1 too short,"),
         "{err}"
     );
 }
