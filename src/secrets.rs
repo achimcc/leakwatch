@@ -17,22 +17,42 @@ pub struct RuntimeSecrets {
     pub roots: Vec<PathBuf>,
 }
 
-impl Secrets for RuntimeSecrets {
-    fn load(&self) -> Result<Vec<(String, String)>> {
+/// What [`RuntimeSecrets::load_detailed`] saw.
+pub struct Loaded {
+    pub values: Vec<(String, String)>,
+    /// Regular files (or whole roots) that exist but could not be read —
+    /// a non-root caller on the host sees `/run/secrets/rendered` like that.
+    pub unreadable: usize,
+}
+
+impl RuntimeSecrets {
+    fn read_roots(&self, prefix_rendered: bool) -> Loaded {
         let mut out = Vec::new();
+        let mut unreadable = 0;
         for root in &self.roots {
             let entries = match std::fs::read_dir(root) {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(_) => {
+                    if root.exists() {
+                        unreadable += 1;
+                    }
+                    continue;
+                }
+            };
+            let prefix = if prefix_rendered && root.file_name().is_some_and(|f| f == "rendered") {
+                "rendered/"
+            } else {
+                ""
             };
             for entry in entries.flatten() {
                 if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                     continue;
                 }
                 let Ok(mut value) = std::fs::read_to_string(entry.path()) else {
+                    unreadable += 1;
                     continue;
                 };
-                let name = entry.file_name().to_string_lossy().to_string();
+                let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
                 // In place, not a trimmed copy: every copy is one more buffer
                 // that outlives its use. `Scanner::new` wipes this one.
                 if value.ends_with('\n') {
@@ -41,6 +61,30 @@ impl Secrets for RuntimeSecrets {
                 out.push((name, value));
             }
         }
+        Loaded {
+            values: out,
+            unreadable,
+        }
+    }
+
+    /// Like `load`, but says what it could not read, and names a value from
+    /// a `rendered` root with the prefix `rendered/` (a template, which
+    /// contains secrets rather than being one).
+    pub fn load_detailed(&self) -> Result<Loaded> {
+        let loaded = self.read_roots(true);
+        if loaded.values.is_empty() && loaded.unreadable == 0 {
+            bail!(
+                "no secrets found under {:?} — without patterns a run says nothing",
+                self.roots
+            );
+        }
+        Ok(loaded)
+    }
+}
+
+impl Secrets for RuntimeSecrets {
+    fn load(&self) -> Result<Vec<(String, String)>> {
+        let out = self.read_roots(false).values;
         if out.is_empty() {
             bail!(
                 "no secrets found under {:?} — without patterns a run says nothing",
@@ -183,6 +227,34 @@ pub fn multiline_note(values: &[(String, String)]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_detailed_counts_unreadable_and_prefixes_rendered() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let rendered = dir.path().join("rendered");
+        std::fs::create_dir(&rendered).unwrap();
+        std::fs::write(dir.path().join("plain-key"), "abc123def456\n").unwrap();
+        std::fs::write(rendered.join("service-env"), "KEY=abc123def456\n").unwrap();
+        let locked = dir.path().join("locked-key");
+        std::fs::write(&locked, "zzz999yyy888").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&locked).is_ok() {
+            return; // root reads everything; the count cannot be provoked
+        }
+        let s = RuntimeSecrets {
+            roots: vec![dir.path().to_path_buf(), rendered.clone()],
+        };
+        let got = s.load_detailed().unwrap();
+        let mut names: Vec<&str> = got.values.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["plain-key", "rendered/service-env"]);
+        assert_eq!(got.unreadable, 1);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // `load` is untouched: no prefix, nothing counted.
+        let plain = s.load().unwrap();
+        assert!(plain.iter().any(|(n, _)| n == "service-env"));
+    }
 
     #[test]
     fn runtime_reads_every_file_in_a_root() {

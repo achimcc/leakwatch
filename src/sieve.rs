@@ -120,31 +120,67 @@ impl Sieve {
         Ok(())
     }
 
-    /// One line in, one line out. Both layers look at the ORIGINAL line:
-    /// the known values decide first, a guess that overlaps a known span is
-    /// dropped — and so the mask `<REDACTED:x>` can never be re-matched as
-    /// a bearer token by the guess layer.
+    /// One line in, one line out. Both layers look at the ORIGINAL line;
+    /// overlapping spans are merged into one mask, and a merged span that
+    /// contains a known value carries the known names — so a guess that
+    /// reaches beyond a known value masks the union, and the mask
+    /// `<REDACTED:x>` can never be re-matched as a bearer token.
     pub fn sieve_line(&self, line: &str, counts: &mut Counts) -> String {
         counts.lines += 1;
         let hits = self.scanner.scan_line(line);
-        let named = named_spans(&hits, line.len());
-        counts.known += named.len() as u64;
-        let mut masks: Vec<((usize, usize), String)> = Vec::new();
-        for ((s, e), n) in &named {
-            for part in n.split(',') {
-                counts.names.insert(part.to_string());
-            }
-            masks.push(((*s, *e), format!("<REDACTED:{n}>")));
-        }
+        let mut spans: Vec<((usize, usize), Option<String>, &'static str)> =
+            named_spans(&hits, line.len())
+                .into_iter()
+                .map(|(sp, n)| (sp, Some(n), ""))
+                .collect();
         if self.guess {
-            for ((s, e), kind) in guess::spans(line) {
-                if named.iter().any(|((ks, ke), _)| s < *ke && *ks < e) {
-                    continue;
+            spans.extend(
+                guess::spans(line)
+                    .into_iter()
+                    .map(|(sp, kind)| (sp, None, kind)),
+            );
+        }
+        spans.sort_by_key(|((s, _), _, _)| *s);
+        // Merge overlapping and touching spans; known names win over kinds.
+        let mut merged: Vec<((usize, usize), Option<String>, &'static str)> = Vec::new();
+        for (sp, name, kind) in spans {
+            if let Some(((_, le), lname, lkind)) = merged.last_mut()
+                && sp.0 <= *le
+            {
+                *le = (*le).max(sp.1);
+                match (&mut *lname, name) {
+                    (Some(a), Some(b)) if *a != b => {
+                        let mut set: BTreeSet<&str> = a.split(',').chain(b.split(',')).collect();
+                        if set.iter().any(|n| !n.starts_with(TEMPLATE_PREFIX)) {
+                            set.retain(|n| !n.starts_with(TEMPLATE_PREFIX));
+                        }
+                        *a = set.into_iter().collect::<Vec<_>>().join(",");
+                    }
+                    (None, Some(b)) => *lname = Some(b),
+                    _ => {}
                 }
-                counts.guessed += 1;
-                masks.push(((s, e), format!("<REDACTED?:{kind}>")));
+                if lkind.is_empty() {
+                    *lkind = kind;
+                }
+                continue;
             }
-            masks.sort_by_key(|((s, _), _)| *s);
+            merged.push((sp, name, kind));
+        }
+        let mut masks: Vec<((usize, usize), String)> = Vec::new();
+        for (sp, name, kind) in merged {
+            match name {
+                Some(n) => {
+                    counts.known += 1;
+                    for part in n.split(',') {
+                        counts.names.insert(part.to_string());
+                    }
+                    masks.push((sp, format!("<REDACTED:{n}>")));
+                }
+                None => {
+                    counts.guessed += 1;
+                    masks.push((sp, format!("<REDACTED?:{kind}>")));
+                }
+            }
         }
         sanitize(&apply(line, &masks))
     }
@@ -229,6 +265,16 @@ mod tests {
         let s = sieve(vec![("tok", A)], false);
         let (out, _) = run(&s, "Authorization: Bearer unknown-token-xyz");
         assert_eq!(out, "Authorization: Bearer unknown-token-xyz");
+    }
+
+    /// A guess that reaches beyond a known span masks the union: the tail
+    /// of a longer token whose head is a known value must not survive.
+    #[test]
+    fn guess_overlapping_known_masks_the_union() {
+        let s = sieve(vec![("tok", A)], true);
+        let (out, c) = run(&s, &format!("Authorization: Bearer {A}-and-a-tail"));
+        assert_eq!(out, "Authorization: Bearer <REDACTED:tok>");
+        assert_eq!((c.known, c.guessed), (1, 0));
     }
 
     #[test]
