@@ -27,6 +27,12 @@ impl Scanner {
     pub fn new(secrets: Vec<(String, String)>) -> Result<Scanner> {
         let mut names: Vec<String> = Vec::new();
         let mut values: Vec<String> = Vec::new();
+        // Lines of multi-line values wait until every secret's own patterns
+        // are known: a line that IS another secret (a template carrying
+        // NTFY_BUTTON_TOKEN=<ntfy-token-knopf>) is that secret, and a second
+        // pattern under the template's name would report the same span twice
+        // and escape the other secret's exception (2026-10-23, 672 hits).
+        let mut lines: Vec<(String, String)> = Vec::new();
         let mut searched = 0usize;
         for (name, mut raw) in secrets {
             // Trim once: use the trimmed value for both the length check and
@@ -53,13 +59,22 @@ impl Scanner {
             }
             for l in variants::lines(&v) {
                 if values[first..].contains(&l) {
+                    let mut l = l;
+                    l.zeroize();
                     continue;
                 }
-                names.push(Kind::Line.name(&name));
-                values.push(l);
+                lines.push((Kind::Line.name(&name), l));
             }
             names.push(name);
             values.push(v);
+        }
+        for (name, mut l) in lines {
+            if values.contains(&l) {
+                l.zeroize();
+                continue;
+            }
+            names.push(name);
+            values.push(l);
         }
         let longest = values.iter().map(|v| v.len()).max().unwrap_or(0);
         let ac = AhoCorasick::new(&values).context("building the automaton");
@@ -329,6 +344,51 @@ mod tests {
         // The normal shape of a secret read from a file.
         let s = Scanner::new(vec![("k".into(), "abc123def456ghi789\n".into())]).unwrap();
         assert_eq!(s.scan_line("x abc123def456ghi789 y").len(), 1);
+    }
+
+    #[test]
+    fn a_template_line_that_is_another_secret_is_reported_under_that_secret() {
+        // 2026-10-23: insist-env carries NTFY_BUTTON_TOKEN=<ntfy-token-knopf>.
+        // The same value under the template's name escaped the exception for
+        // ntfy-token-knopf (672 hits in ntfy's cache) — the hit belongs to
+        // the secret the line IS, and only to it.
+        let knopf = "tk_knopf0123456789abcdefghij";
+        let s = Scanner::new(vec![
+            (
+                "insist-env".into(),
+                format!("NTFY_TOPIC=alarme\nNTFY_BUTTON_TOKEN={knopf}\nWEBHOOK_TOKEN=tk_hook0123456789abcdefghijk"),
+            ),
+            ("ntfy-token-knopf".into(), knopf.into()),
+        ])
+        .unwrap();
+        let names: Vec<String> = s
+            .scan_line(&format!("Authorization: Bearer {knopf}"))
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, vec!["ntfy-token-knopf"]);
+        // The template's other secret-named line is still its own pattern.
+        let names: Vec<String> = s
+            .scan_line("x tk_hook0123456789abcdefghijk y")
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, vec!["insist-env[line]"]);
+    }
+
+    #[test]
+    fn a_template_line_is_dropped_whatever_order_the_secrets_come_in() {
+        let knopf = "tk_knopf0123456789abcdefghij";
+        let s = Scanner::new(vec![
+            ("ntfy-token-knopf".into(), knopf.into()),
+            (
+                "insist-env".into(),
+                format!("A=1\nNTFY_BUTTON_TOKEN={knopf}"),
+            ),
+        ])
+        .unwrap();
+        let names: Vec<String> = s.scan_line(knopf).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["ntfy-token-knopf"]);
     }
 
     #[test]

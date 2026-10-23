@@ -191,7 +191,10 @@ configuration, a PEM key) is masked by its key-shaped lines and by the
 values of its `k = v` lines whose key is named like a secret (`PrivateKey`,
 `*_PASSWORD`, `*token*`; 0.3.4 — 0.3.2 took every assignment and reported
 every ntfy topic of a rendered template in ntfy's own cache); the closing
-line counts such values. A line that is not valid UTF-8 is read lossily
+line counts such values. Such a line that IS another secret's value (a
+template carrying `NTFY_BUTTON_TOKEN=<ntfy-token-knopf>`) is no pattern of its
+own: the hit carries that secret's name, so that secret's exception applies
+(0.3.5 — 0.3.4 reported the same span under both names). A line that is not valid UTF-8 is read lossily
 (0.3.4), never ends the run.
 
 ## Exceptions
