@@ -98,7 +98,7 @@ impl Finding {
 }
 
 /// Merge overlapping and touching spans, sorted by start.
-fn merge(spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
+pub(crate) fn merge(spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut spans = spans.to_vec();
     spans.sort_unstable_by_key(|(start, _)| *start);
     let mut merged: Vec<(usize, usize)> = Vec::new();

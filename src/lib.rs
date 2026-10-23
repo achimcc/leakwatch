@@ -5,5 +5,6 @@ pub mod metrics;
 pub mod report;
 pub mod scan;
 pub mod secrets;
+pub mod sieve;
 pub mod sources;
 pub mod variants;

@@ -48,6 +48,13 @@ pub struct Probe {
     line: String,
 }
 
+impl Probe {
+    /// The probe line as it goes into a stream.
+    pub fn text(&self) -> &str {
+        &self.line
+    }
+}
+
 /// The probe lines for the kinds `scanner` carries for the canary.
 ///
 /// EACH IS A REAL EMBEDDING, not the pattern itself: `base64("u:" + value +
