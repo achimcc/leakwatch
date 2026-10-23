@@ -1,5 +1,6 @@
 pub mod canary;
 pub mod config;
+pub mod guess;
 pub mod metrics;
 pub mod report;
 pub mod scan;
